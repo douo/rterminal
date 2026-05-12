@@ -63,8 +63,22 @@ fn encode_special_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
         return Some(bytes);
     }
 
-    // Alt-modified printable keys are sent as ESC + key bytes.
+    // On macOS with Option-as-Meta enabled, the system may still surface
+    // key_char as a transformed glyph (e.g. Option+W -> ∑). For terminal
+    // Meta bindings we want the physical printable key instead.
     if modifiers.alt && !modifiers.control {
+        if key.chars().count() == 1 && key.is_ascii() {
+            if keystroke
+                .key_char
+                .as_ref()
+                .is_some_and(|value| !value.is_empty() && !value.is_ascii())
+            {
+                let mut bytes = vec![0x1b];
+                bytes.extend_from_slice(key.as_bytes());
+                return Some(bytes);
+            }
+        }
+
         if let Some(key_char) = keystroke
             .key_char
             .as_ref()
@@ -294,5 +308,32 @@ mod tests {
     fn encodes_alt_printable_with_escape_prefix() {
         let ks = gpui::Keystroke::parse("alt-x").expect("parse alt-x");
         assert_eq!(encode_keystroke(&ks), Some(vec![0x1b, b'x']));
+    }
+
+    #[test]
+    fn encodes_alt_ascii_key_instead_of_macos_option_glyph() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                alt: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "w".to_string(),
+            key_char: Some("∑".to_string()),
+        };
+        assert_eq!(encode_keystroke(&ks), Some(vec![0x1b, b'w']));
+    }
+
+    #[test]
+    fn preserves_alt_shift_ascii_key_characters() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                alt: true,
+                shift: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "w".to_string(),
+            key_char: Some("W".to_string()),
+        };
+        assert_eq!(encode_keystroke(&ks), Some(vec![0x1b, b'W']));
     }
 }

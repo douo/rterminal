@@ -564,7 +564,8 @@ impl Render for AgentTerminal {
             .size_full()
             .bg(palette.app_bg)
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::on_key_down));
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up));
 
         let root = if self.show_title_bar {
             root.child(title_bar)
@@ -617,6 +618,27 @@ mod tests {
             count_occurrences(source, &keydown_binding),
             1,
             "keydown listener should be bound once to avoid duplicate key handling"
+        );
+    }
+
+    #[test]
+    fn render_keeps_keyup_binding_on_root() {
+        let source = include_str!("render.rs");
+        let keyup_binding = [".on_key_up(", "cx.listener(Self::on_key_up)", ")"].concat();
+        assert!(
+            source.contains(&keyup_binding),
+            "render root must bind keyup so kitty REPORT_EVENT_TYPES can emit release events"
+        );
+    }
+
+    #[test]
+    fn render_binds_keyup_exactly_once() {
+        let source = include_str!("render.rs");
+        let keyup_binding = [".on_key_up(", "cx.listener(Self::on_key_up)", ")"].concat();
+        assert_eq!(
+            count_occurrences(source, &keyup_binding),
+            1,
+            "keyup listener should be bound once to avoid duplicate release events"
         );
     }
 }

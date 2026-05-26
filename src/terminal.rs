@@ -316,6 +316,7 @@ impl AgentTerminal {
             };
         let term_config = Config {
             ambiguous_wide: matches!(cli.ambiguous_width, AmbiguousWidth::Double),
+            kitty_keyboard: true,
             ..Config::default()
         };
         let term = Term::new(
@@ -1312,6 +1313,138 @@ mod tests {
             PendingTerminalEvent::ClipboardLoad(ClipboardType::Clipboard, _) => {}
             _ => panic!("expected clipboard load event"),
         }
+    }
+
+    #[test]
+    fn kitty_keyboard_query_is_ignored_when_terminal_config_disables_protocol() {
+        let (writer, bytes) = recording_writer();
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize { cols: 80, rows: 24 },
+            TitleTrackingListener {
+                title,
+                writer: Some(writer),
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        processor.advance(&mut term, b"\x1b[?u");
+
+        assert!(bytes.lock().is_empty());
+        assert!(!term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+    }
+
+    #[test]
+    fn kitty_keyboard_runtime_push_enables_mode_when_app_config_allows_protocol() {
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
+        let mut term = Term::new(
+            config,
+            &GridSize { cols: 80, rows: 24 },
+            TitleTrackingListener {
+                title,
+                writer: None,
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        processor.advance(&mut term, b"\x1b[>1u");
+
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+    }
+
+    #[test]
+    fn kitty_keyboard_set_mode_updates_active_mode_when_enabled() {
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
+        let mut term = Term::new(
+            config,
+            &GridSize { cols: 80, rows: 24 },
+            TitleTrackingListener {
+                title,
+                writer: None,
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        processor.advance(&mut term, b"\x1b[=1;1u");
+
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+    }
+
+    #[test]
+    fn kitty_keyboard_query_reports_pushed_mode_when_enabled() {
+        let (writer, bytes) = recording_writer();
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
+        let mut term = Term::new(
+            config,
+            &GridSize { cols: 80, rows: 24 },
+            TitleTrackingListener {
+                title,
+                writer: Some(writer),
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        processor.advance(&mut term, b"\x1b[>1u");
+        processor.advance(&mut term, b"\x1b[?u");
+
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert_eq!(&*bytes.lock(), b"\x1b[?1u");
+    }
+
+    #[test]
+    fn kitty_keyboard_push_and_pop_modes_when_enabled() {
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
+        let mut term = Term::new(
+            config,
+            &GridSize { cols: 80, rows: 24 },
+            TitleTrackingListener {
+                title,
+                writer: None,
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        processor.advance(&mut term, b"\x1b[>1u");
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!term.mode().contains(TermMode::REPORT_EVENT_TYPES));
+
+        processor.advance(&mut term, b"\x1b[>3u");
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(term.mode().contains(TermMode::REPORT_EVENT_TYPES));
+
+        processor.advance(&mut term, b"\x1b[<u");
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!term.mode().contains(TermMode::REPORT_EVENT_TYPES));
+
+        processor.advance(&mut term, b"\x1b[<u");
+        assert!(!term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
     }
 
     #[test]

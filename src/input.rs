@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::TermMode;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, InputHandler, KeyDownEvent,
+    App, Bounds, ClipboardItem, Context, EntityInputHandler, InputHandler, KeyDownEvent, KeyUpEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PromptLevel, ScrollDelta,
     ScrollWheelEvent, UTF16Selection, Window, point, px, size,
 };
@@ -12,8 +12,8 @@ use serde_json::json;
 
 use crate::AgentTerminal;
 use crate::keyboard::{
-    encode_keystroke, is_paste_shortcut, is_select_all_shortcut, is_zoom_in_shortcut,
-    is_zoom_out_shortcut, should_defer_to_text_input,
+    KittyKeyEventType, encode_keystroke_with_mode, is_paste_shortcut, is_select_all_shortcut,
+    is_zoom_in_shortcut, is_zoom_out_shortcut, should_defer_to_text_input,
 };
 use crate::macos_ax::NativeAxInputState;
 use crate::render::{
@@ -862,7 +862,10 @@ impl AgentTerminal {
             return;
         }
 
-        if should_defer_to_text_input(&event.keystroke, self.option_as_meta) {
+        let terminal_mode = *self.term.mode();
+        if should_defer_to_text_input(&event.keystroke, self.option_as_meta)
+            && !terminal_mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
+        {
             self.mark_local_key_activity();
             self.trace_input("keydown deferred to text input handler");
             self.log_input_event(
@@ -875,7 +878,13 @@ impl AgentTerminal {
             return;
         }
 
-        if let Some(bytes) = encode_keystroke(&event.keystroke) {
+        let event_type = if event.is_held {
+            KittyKeyEventType::Repeat
+        } else {
+            KittyKeyEventType::Press
+        };
+        if let Some(bytes) = encode_keystroke_with_mode(&event.keystroke, terminal_mode, event_type)
+        {
             self.mark_local_key_activity();
             self.debug.record_key_event();
             let before_line = self.input_line.clone();
@@ -912,6 +921,39 @@ impl AgentTerminal {
                     self.mark_enter_latency_write_done(probe_id, bytes.len());
                 }
             }
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_key_up(
+        &mut self,
+        event: &KeyUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_mode = *self.term.mode();
+        if !terminal_mode.contains(TermMode::REPORT_EVENT_TYPES) {
+            return;
+        }
+
+        self.trace_input(format!(
+            "keyup key={:?} key_char={:?} modifiers={:?}",
+            event.keystroke.key, event.keystroke.key_char, event.keystroke.modifiers
+        ));
+        if let Some(bytes) =
+            encode_keystroke_with_mode(&event.keystroke, terminal_mode, KittyKeyEventType::Release)
+        {
+            self.mark_local_key_activity();
+            self.debug.record_key_event();
+            self.write_bytes(&bytes);
+            self.log_input_event(
+                "keyup_encoded",
+                json!({
+                    "key": event.keystroke.key.clone(),
+                    "bytes_hex": bytes_to_hex(&bytes),
+                }),
+            );
             cx.stop_propagation();
             cx.notify();
         }

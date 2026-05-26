@@ -89,6 +89,8 @@ This is **not** intended to be a general-purpose terminal replacement. It is an 
 - Terminal title tracking via OSC sequences
 - Clickable URL support: `Cmd`-click OSC 8 or visible `http://`, `https://`,
   and `file://` links to open them in the default browser
+- Kitty keyboard protocol support: terminal applications can enable CSI-u
+  keyboard encoding at runtime with the protocol's mode control sequences
 
 ### Input & Accessibility
 - Full keyboard input: printable text, Ctrl/Alt/Shift chords, function keys, special keys
@@ -169,6 +171,32 @@ between shell-escaped paths.
 | `--input-log-raw` | off | Include full text values in input log (not truncated) |
 | `--self-check` | — | Run startup self-check and exit |
 
+### Kitty Keyboard Protocol
+
+The terminal accepts the runtime mode negotiation described by the
+[kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
+Keyboard input remains legacy by default; CSI-u encoding is activated only
+after a terminal application sends a mode control sequence such as
+`CSI > flags u` or `CSI = flags ; mode u`, and is deactivated again by the
+protocol's pop/difference controls.
+
+Supported protocol behavior:
+- `CSI ? u` reports the current enhancement flags.
+- `CSI = flags ; mode u`, `CSI > flags u`, and `CSI < number u` update, push,
+  and pop keyboard enhancement modes through `alacritty_terminal`.
+- Active `DISAMBIGUATE_ESC_CODES` and `REPORT_ALL_KEYS_AS_ESC` modes switch key
+  encoding to CSI-u where the protocol requires it.
+- `REPORT_EVENT_TYPES` sends press, repeat, and release event types. GPUI repeat
+  detection is based on key-down `is_held`; release events are emitted from
+  key-up.
+- `REPORT_ALTERNATE_KEYS` includes shifted text when GPUI exposes it, and
+  `REPORT_ASSOCIATED_TEXT` includes text code points with
+  `REPORT_ALL_KEYS_AS_ESC`.
+
+Boundary: GPUI exposes logical keystrokes rather than full physical keyboard
+layout metadata, so alternate layout key reporting is limited to shifted text
+available on the event.
+
 ## Tech Stack
 
 - **UI Framework**: [GPUI](https://github.com/zed-industries/zed) — Zed's GPU-accelerated, Rust-native UI framework
@@ -196,6 +224,9 @@ cargo run -- --self-check
 - **No scrollback UI** — terminal scrollback buffer exists in `alacritty_terminal` but is not yet exposed through scroll interaction
 - **No search** — no find-in-terminal functionality
 - **No bold/italic font variants** — text style flags are parsed but not rendered with distinct font faces
+- **Kitty keyboard physical-layout detail** — runtime mode negotiation and
+  CSI-u event encoding are supported, but alternate layout key reporting is
+  limited by GPUI's logical keystroke data
 
 ## License
 

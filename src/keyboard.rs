@@ -1,3 +1,12 @@
+use alacritty_terminal::term::TermMode;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KittyKeyEventType {
+    Press,
+    Repeat,
+    Release,
+}
+
 pub(crate) fn encode_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
     // Reserve platform/function chords for app-level shortcuts such as paste.
     if keystroke.modifiers.platform || keystroke.modifiers.function {
@@ -9,6 +18,28 @@ pub(crate) fn encode_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
     }
 
     encode_printable_keystroke(keystroke)
+}
+
+pub(crate) fn encode_keystroke_with_mode(
+    keystroke: &gpui::Keystroke,
+    mode: TermMode,
+    event_type: KittyKeyEventType,
+) -> Option<Vec<u8>> {
+    // Reserve platform/function chords for app-level shortcuts such as paste.
+    if keystroke.modifiers.platform || keystroke.modifiers.function {
+        return None;
+    }
+
+    if mode.intersects(TermMode::KITTY_KEYBOARD_PROTOCOL)
+        && let Some(bytes) = encode_kitty_keystroke(keystroke, mode, event_type)
+    {
+        return Some(bytes);
+    }
+
+    match event_type {
+        KittyKeyEventType::Release => None,
+        KittyKeyEventType::Press | KittyKeyEventType::Repeat => encode_keystroke(keystroke),
+    }
 }
 
 fn encode_special_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
@@ -97,6 +128,239 @@ fn encode_special_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+fn encode_kitty_keystroke(
+    keystroke: &gpui::Keystroke,
+    mode: TermMode,
+    event_type: KittyKeyEventType,
+) -> Option<Vec<u8>> {
+    if event_type != KittyKeyEventType::Press && !mode.contains(TermMode::REPORT_EVENT_TYPES) {
+        return None;
+    }
+
+    if keystroke.is_ime_in_progress() {
+        return None;
+    }
+
+    let key = keystroke.key.as_str();
+    let report_all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES);
+    let report_events = mode.contains(TermMode::REPORT_EVENT_TYPES);
+
+    if report_all {
+        if let Some(bytes) = encode_kitty_csi_u(keystroke, mode, event_type) {
+            return Some(bytes);
+        }
+        return encode_kitty_functional_key(
+            key,
+            modifier_code(keystroke),
+            report_events,
+            event_type,
+        );
+    }
+
+    if report_events
+        && event_type != KittyKeyEventType::Press
+        && let Some(bytes) =
+            encode_kitty_functional_key(key, modifier_code(keystroke), true, event_type)
+    {
+        return Some(bytes);
+    }
+
+    if disambiguate && should_disambiguate_as_csi_u(keystroke) {
+        return encode_kitty_csi_u(keystroke, mode, event_type);
+    }
+
+    if report_events
+        && event_type == KittyKeyEventType::Press
+        && let Some(bytes) =
+            encode_kitty_functional_key(key, modifier_code(keystroke), true, event_type)
+    {
+        return Some(bytes);
+    }
+
+    None
+}
+
+fn should_disambiguate_as_csi_u(keystroke: &gpui::Keystroke) -> bool {
+    let key = keystroke.key.as_str();
+    let modifiers = keystroke.modifiers;
+
+    if key == "escape" {
+        return true;
+    }
+
+    if matches!(key, "tab" | "enter" | "backspace") {
+        return modifiers.control || modifiers.alt || (modifiers.shift && modifiers.alt);
+    }
+
+    (modifiers.alt || modifiers.control || (modifiers.shift && modifiers.alt))
+        && kitty_key_code(keystroke).is_some()
+}
+
+fn encode_kitty_csi_u(
+    keystroke: &gpui::Keystroke,
+    mode: TermMode,
+    event_type: KittyKeyEventType,
+) -> Option<Vec<u8>> {
+    let key_code = kitty_key_code(keystroke)?;
+    let first_field = kitty_key_code_field(keystroke, key_code, mode);
+    let modifier_field = kitty_modifier_field(modifier_code(keystroke), mode, event_type);
+    let text_field = kitty_associated_text_field(keystroke, mode);
+
+    let mut seq = format!("\x1b[{first_field};{modifier_field}");
+    if let Some(text_field) = text_field {
+        seq.push(';');
+        seq.push_str(&text_field);
+    }
+    seq.push('u');
+    Some(seq.into_bytes())
+}
+
+fn kitty_key_code(keystroke: &gpui::Keystroke) -> Option<u32> {
+    match keystroke.key.as_str() {
+        "escape" => return Some(27),
+        "enter" => return Some(13),
+        "tab" => return Some(9),
+        "backspace" => return Some(127),
+        "space" => return Some(32),
+        "shift" => return Some(57441),
+        "control" | "ctrl" => return Some(57442),
+        "alt" | "option" => return Some(57443),
+        "super" | "cmd" | "command" => return Some(57444),
+        _ => {}
+    }
+
+    let mut key_chars = keystroke.key.chars();
+    if let (Some(ch), None) = (key_chars.next(), key_chars.next()) {
+        return Some(normalize_key_code_char(ch) as u32);
+    }
+
+    let key_char = keystroke.key_char.as_deref()?;
+    let mut chars = key_char.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() && !ch.is_control() {
+        return Some(normalize_key_code_char(ch) as u32);
+    }
+
+    None
+}
+
+fn normalize_key_code_char(ch: char) -> char {
+    if ch.is_ascii_alphabetic() {
+        ch.to_ascii_lowercase()
+    } else {
+        ch
+    }
+}
+
+fn kitty_key_code_field(keystroke: &gpui::Keystroke, key_code: u32, mode: TermMode) -> String {
+    if !mode.contains(TermMode::REPORT_ALTERNATE_KEYS) || !keystroke.modifiers.shift {
+        return key_code.to_string();
+    }
+
+    let Some(shifted) = shifted_single_codepoint(keystroke) else {
+        return key_code.to_string();
+    };
+
+    if shifted == key_code {
+        key_code.to_string()
+    } else {
+        format!("{key_code}:{shifted}")
+    }
+}
+
+fn shifted_single_codepoint(keystroke: &gpui::Keystroke) -> Option<u32> {
+    let value = keystroke.key_char.as_deref()?;
+    let mut chars = value.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() && !ch.is_control() {
+        Some(ch as u32)
+    } else {
+        None
+    }
+}
+
+fn kitty_modifier_field(
+    modifier_code: u8,
+    mode: TermMode,
+    event_type: KittyKeyEventType,
+) -> String {
+    if mode.contains(TermMode::REPORT_EVENT_TYPES) {
+        format!("{modifier_code}:{}", kitty_event_type_code(event_type))
+    } else {
+        modifier_code.to_string()
+    }
+}
+
+fn kitty_event_type_code(event_type: KittyKeyEventType) -> u8 {
+    match event_type {
+        KittyKeyEventType::Press => 1,
+        KittyKeyEventType::Repeat => 2,
+        KittyKeyEventType::Release => 3,
+    }
+}
+
+fn kitty_associated_text_field(keystroke: &gpui::Keystroke, mode: TermMode) -> Option<String> {
+    if !mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
+        || !mode.contains(TermMode::REPORT_ASSOCIATED_TEXT)
+    {
+        return None;
+    }
+
+    let text = keystroke.key_char.as_deref()?;
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+
+    Some(
+        text.chars()
+            .map(|ch| (ch as u32).to_string())
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+fn encode_kitty_functional_key(
+    key: &str,
+    modifier_code: u8,
+    report_events: bool,
+    event_type: KittyKeyEventType,
+) -> Option<Vec<u8>> {
+    let event_suffix = if report_events {
+        format!(":{}", kitty_event_type_code(event_type))
+    } else {
+        String::new()
+    };
+
+    let seq = match key {
+        "up" => format!("\x1b[1;{modifier_code}{event_suffix}A"),
+        "down" => format!("\x1b[1;{modifier_code}{event_suffix}B"),
+        "right" => format!("\x1b[1;{modifier_code}{event_suffix}C"),
+        "left" => format!("\x1b[1;{modifier_code}{event_suffix}D"),
+        "home" => format!("\x1b[1;{modifier_code}{event_suffix}H"),
+        "end" => format!("\x1b[1;{modifier_code}{event_suffix}F"),
+        "insert" => format!("\x1b[2;{modifier_code}{event_suffix}~"),
+        "delete" => format!("\x1b[3;{modifier_code}{event_suffix}~"),
+        "pageup" => format!("\x1b[5;{modifier_code}{event_suffix}~"),
+        "pagedown" => format!("\x1b[6;{modifier_code}{event_suffix}~"),
+        "f1" => format!("\x1b[1;{modifier_code}{event_suffix}P"),
+        "f2" => format!("\x1b[1;{modifier_code}{event_suffix}Q"),
+        "f3" => format!("\x1b[13;{modifier_code}{event_suffix}~"),
+        "f4" => format!("\x1b[1;{modifier_code}{event_suffix}S"),
+        "f5" => format!("\x1b[15;{modifier_code}{event_suffix}~"),
+        "f6" => format!("\x1b[17;{modifier_code}{event_suffix}~"),
+        "f7" => format!("\x1b[18;{modifier_code}{event_suffix}~"),
+        "f8" => format!("\x1b[19;{modifier_code}{event_suffix}~"),
+        "f9" => format!("\x1b[20;{modifier_code}{event_suffix}~"),
+        "f10" => format!("\x1b[21;{modifier_code}{event_suffix}~"),
+        "f11" => format!("\x1b[23;{modifier_code}{event_suffix}~"),
+        "f12" => format!("\x1b[24;{modifier_code}{event_suffix}~"),
+        _ => return None,
+    };
+
+    Some(seq.into_bytes())
 }
 
 fn encode_modified_special_key(key: &str, modifier_code: u8) -> Option<Vec<u8>> {
@@ -335,5 +599,100 @@ mod tests {
             key_char: Some("W".to_string()),
         };
         assert_eq!(encode_keystroke(&ks), Some(vec![0x1b, b'W']));
+    }
+
+    #[test]
+    fn mode_aware_encoding_keeps_default_legacy_behavior() {
+        let ks = gpui::Keystroke::parse("alt-x").expect("parse alt-x");
+        assert_eq!(
+            encode_keystroke_with_mode(&ks, TermMode::default(), KittyKeyEventType::Press),
+            Some(vec![0x1b, b'x'])
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguates_alt_printable_as_csi_u() {
+        let ks = gpui::Keystroke::parse("alt-x").expect("parse alt-x");
+        assert_eq!(
+            encode_keystroke_with_mode(
+                &ks,
+                TermMode::DISAMBIGUATE_ESC_CODES,
+                KittyKeyEventType::Press
+            ),
+            Some(b"\x1b[120;3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_reports_all_plain_printable_keys_as_csi_u() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "x".to_string(),
+            key_char: Some("x".to_string()),
+        };
+        assert_eq!(
+            encode_keystroke_with_mode(
+                &ks,
+                TermMode::REPORT_ALL_KEYS_AS_ESC,
+                KittyKeyEventType::Press
+            ),
+            Some(b"\x1b[120;1u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_reports_repeat_event_type_when_requested() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "x".to_string(),
+            key_char: Some("x".to_string()),
+        };
+        assert_eq!(
+            encode_keystroke_with_mode(
+                &ks,
+                TermMode::REPORT_ALL_KEYS_AS_ESC | TermMode::REPORT_EVENT_TYPES,
+                KittyKeyEventType::Repeat
+            ),
+            Some(b"\x1b[120;1:2u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_reports_release_event_type_when_requested() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "x".to_string(),
+            key_char: Some("x".to_string()),
+        };
+        assert_eq!(
+            encode_keystroke_with_mode(
+                &ks,
+                TermMode::REPORT_ALL_KEYS_AS_ESC | TermMode::REPORT_EVENT_TYPES,
+                KittyKeyEventType::Release
+            ),
+            Some(b"\x1b[120;1:3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_associated_text_embeds_key_char_codepoints() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "a".to_string(),
+            key_char: Some("A".to_string()),
+        };
+        assert_eq!(
+            encode_keystroke_with_mode(
+                &ks,
+                TermMode::REPORT_ALL_KEYS_AS_ESC
+                    | TermMode::REPORT_ALTERNATE_KEYS
+                    | TermMode::REPORT_ASSOCIATED_TEXT,
+                KittyKeyEventType::Press
+            ),
+            Some(b"\x1b[97:65;2;65u".to_vec())
+        );
     }
 }

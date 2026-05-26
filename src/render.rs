@@ -1,5 +1,5 @@
 use gpui::{
-    Bounds, Context, Font, FontFallbacks, Hsla, MouseButton, Pixels, Render, Window,
+    Bounds, Context, ExternalPaths, Font, FontFallbacks, Hsla, MouseButton, Pixels, Render, Window,
     WindowControlArea, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
 };
 use alacritty_terminal::vte::ansi::CursorShape;
@@ -185,6 +185,7 @@ impl Render for AgentTerminal {
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up_right))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
             .child(
                 canvas(
                     move |_, _, _| {},

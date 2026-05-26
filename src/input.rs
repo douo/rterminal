@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::TermMode;
@@ -214,6 +215,31 @@ impl AgentTerminal {
         } else {
             self.write_text_input(&text);
         }
+    }
+
+    pub(crate) fn write_dropped_paths_input(&mut self, paths: &gpui::ExternalPaths) {
+        let text = dropped_paths_text(paths.paths());
+        if text.is_empty() {
+            return;
+        }
+
+        self.mark_local_key_activity();
+        self.insert_input_text_at_cursor(&text);
+        self.write_text_input(&text);
+        self.trace_input(format!(
+            "file-drop paths={} text={}",
+            paths.paths().len(),
+            summarize_text_for_trace(&text)
+        ));
+        self.log_input_event(
+            "file_drop",
+            json!({
+                "path_count": paths.paths().len(),
+                "text": self.input_log_text_value(&text),
+                "input_line": self.input_log_text_value(&self.input_line),
+                "input_cursor_utf16": self.input_cursor_utf16,
+            }),
+        );
     }
 
     pub(crate) fn input_line_len_utf16(&self) -> usize {
@@ -472,6 +498,17 @@ impl AgentTerminal {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+
+    pub(crate) fn on_external_paths_drop(
+        &mut self,
+        paths: &gpui::ExternalPaths,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.write_dropped_paths_input(paths);
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn on_mouse_down(
@@ -1234,6 +1271,42 @@ fn evaluate_paste_risk(text: &str) -> Option<PasteRisk> {
     })
 }
 
+fn dropped_paths_text(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| shell_escape_path(&absolute_path(path)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn shell_escape_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text.is_empty() {
+        return "''".to_string();
+    }
+    let mut escaped = String::with_capacity(text.len() + 2);
+    escaped.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
 fn normalize_selection_bounds(
     start: SelectionPoint,
     end: SelectionPoint,
@@ -1535,13 +1608,14 @@ impl EntityInputHandler for AgentTerminal {
 #[cfg(test)]
 mod tests {
     use gpui::px;
+    use std::path::PathBuf;
 
     use crate::render::terminal_content_padding_y;
     use crate::terminal::CellSnapshot;
 
     use super::{
-        evaluate_paste_risk, extract_selection_text, normalize_selection_bounds,
-        probable_ascii_prefix_noise, selection_contains_cell,
+        dropped_paths_text, evaluate_paste_risk, extract_selection_text, normalize_selection_bounds,
+        probable_ascii_prefix_noise, selection_contains_cell, shell_escape_path,
     };
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
 
@@ -1643,6 +1717,23 @@ mod tests {
         assert!(!probable_ascii_prefix_noise("前缀你好世界", "你好世界"));
         assert!(!probable_ascii_prefix_noise("12345你好世界", "你好世界"));
         assert!(!probable_ascii_prefix_noise("你好世界abc", "你好世界"));
+    }
+
+    #[test]
+    fn shell_escape_path_wraps_and_escapes_paths_for_shell_input() {
+        assert_eq!(
+            shell_escape_path(std::path::Path::new("/tmp/a file's name.txt")),
+            "'/tmp/a file'\\''s name.txt'"
+        );
+    }
+
+    #[test]
+    fn dropped_paths_text_joins_absolute_shell_escaped_paths() {
+        let text = dropped_paths_text(&[
+            PathBuf::from("/tmp/one file.txt"),
+            PathBuf::from("/tmp/two's file.txt"),
+        ]);
+        assert_eq!(text, "'/tmp/one file.txt' '/tmp/two'\\''s file.txt'");
     }
 
     fn cell(ch: char) -> CellSnapshot {

@@ -95,6 +95,7 @@ This is **not** intended to be a general-purpose terminal replacement. It is an 
 - Bidirectional AX bridge: external tools can read and modify the current command line
 - AX override guard window (250ms) to avoid conflict between local typing and external edits
 - Paste support with `Cmd+V` / `Ctrl+Shift+V`
+- File drop support: dropped files are inserted as shell-escaped absolute paths
 - Large paste guard: confirmation dialog for multi-line or high non-ASCII content
 - `\n` → `\r` conversion in paste for correct behavior in tmux/vi
 
@@ -143,6 +144,10 @@ cargo run -- --self-check
 # With input debugging
 AGENT_TUI_INPUT_TRACE=1 cargo run -- --input-log-file /tmp/input.jsonl --input-log-raw
 ```
+
+Drag files from Finder onto the terminal to insert their absolute paths at the
+current shell cursor. Multiple files are inserted in drop order with spaces
+between shell-escaped paths.
 
 ### CLI Options
 

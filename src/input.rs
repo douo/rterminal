@@ -511,6 +511,21 @@ impl AgentTerminal {
         cx.notify();
     }
 
+    pub(crate) fn link_at_position(
+        &self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+    ) -> Option<String> {
+        let (row, col) = self.mouse_grid_point(position, window);
+        self.snapshot
+            .cells
+            .get(row)?
+            .get(col)?
+            .link
+            .as_ref()
+            .cloned()
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -527,6 +542,20 @@ impl AgentTerminal {
             event.modifiers.alt,
             event.modifiers.platform
         ));
+
+        if event.button == MouseButton::Left
+            && event.modifiers.platform
+            && !event.modifiers.control
+            && !event.modifiers.alt
+            && !event.modifiers.shift
+            && let Some(uri) = self.link_at_position(event.position, window)
+        {
+            cx.open_url(&uri);
+            self.debug.set_note(Some(format!("opened url: {uri}")));
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
 
         if event.button == MouseButton::Left && event.modifiers.shift {
             let (row, col) = self.mouse_grid_point(event.position, window);

@@ -1,6 +1,7 @@
 use gpui::{
-    Bounds, Context, ExternalPaths, Font, FontFallbacks, Hsla, MouseButton, Pixels, Render, Window,
-    WindowControlArea, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
+    Bounds, Context, ExternalPaths, Font, FontFallbacks, Hitbox, HitboxBehavior, Hsla, MouseButton,
+    Pixels, Render, Window, WindowControlArea, canvas, div, fill, font, point, prelude::*, px, rgb,
+    rgba, size,
 };
 use alacritty_terminal::vte::ansi::CursorShape;
 
@@ -67,6 +68,64 @@ fn visual_extra_cols_before(row: &[crate::terminal::CellSnapshot], logical_col: 
     extra_cols
 }
 
+fn link_hover_bounds(
+    snapshot: &crate::terminal::ScreenSnapshot,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    font_family: &str,
+    font_fallbacks: Option<&FontFallbacks>,
+    font_size: Pixels,
+    line_height: Pixels,
+) -> Option<Bounds<Pixels>> {
+    let mouse = window.mouse_position();
+    if !bounds.contains(&mouse) {
+        return None;
+    }
+
+    let cell_width = measure_cell_width(window, font_family, font_fallbacks, font_size).max(px(1.0));
+    let dynamic_padding_y =
+        terminal_content_padding_y(bounds.size.height, line_height, snapshot.cells.len());
+    let origin = bounds.origin + point(TEXT_PADDING_X, dynamic_padding_y);
+    let raw_row = ((mouse.y - origin.y) / line_height).floor() as isize;
+    if raw_row < 0 {
+        return None;
+    }
+    let row_index = raw_row as usize;
+    let row = snapshot.cells.get(row_index)?;
+    let raw_visual_col = ((mouse.x - origin.x) / cell_width).floor() as f32;
+    if raw_visual_col < 0.0 {
+        return None;
+    }
+
+    let mut covered_until_col = 0usize;
+    let mut extra_visual_cols = 0f32;
+    for (col_index, cell) in row.iter().enumerate() {
+        let is_spacer_col = col_index < covered_until_col;
+        let x_cols = col_index as f32 + extra_visual_cols;
+        let width_cols = cell.width_cols as f32;
+        if !is_spacer_col
+            && cell.link.is_some()
+            && raw_visual_col >= x_cols
+            && raw_visual_col < x_cols + width_cols
+        {
+            let cell_origin = point(origin.x + x_cols * cell_width, origin.y + row_index as f32 * line_height);
+            return Some(Bounds::new(
+                cell_origin,
+                size(cell_width.max(px(2.0)) * width_cols, line_height),
+            ));
+        }
+
+        if !is_spacer_col {
+            covered_until_col = col_index.saturating_add(cell_advance_cols(cell));
+            if cell.expands_layout && cell.width_cols > 1 {
+                extra_visual_cols += f32::from(cell.width_cols - 1);
+            }
+        }
+    }
+
+    None
+}
+
 pub(crate) fn line_height_for(font_size: Pixels) -> Pixels {
     (font_size * LINE_HEIGHT_SCALE).max(font_size + px(2.0))
 }
@@ -89,6 +148,10 @@ struct RenderPalette {
     title_fg: Hsla,
     selection_bg: Hsla,
     cursor_bg: Hsla,
+}
+
+struct TerminalCanvasPrepaint {
+    link_hover_hitbox: Option<Hitbox>,
 }
 
 fn palette_for(theme: Theme) -> RenderPalette {
@@ -168,6 +231,9 @@ impl Render for AgentTerminal {
         let canvas_font_family = font_family.clone();
         let canvas_font_fallbacks = font_fallbacks.clone();
         let canvas_bounds_shared = self.canvas_bounds.clone();
+        let canvas_snapshot = snapshot.clone();
+        let canvas_font_family_for_prepaint = font_family.clone();
+        let canvas_font_fallbacks_for_prepaint = font_fallbacks.clone();
 
         let status_line = if let Some(note) = note {
             format!("agent terminal | {} | {} | note: {}", shell, status, note)
@@ -188,8 +254,20 @@ impl Render for AgentTerminal {
             .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
             .child(
                 canvas(
-                    move |_, _, _| {},
-                    move |bounds, _, window, cx| {
+                    move |bounds, window, _| {
+                        let link_hover_hitbox = link_hover_bounds(
+                            &canvas_snapshot,
+                            bounds,
+                            window,
+                            &canvas_font_family_for_prepaint,
+                            canvas_font_fallbacks_for_prepaint.as_ref(),
+                            font_size,
+                            line_height,
+                        )
+                        .map(|bounds| window.insert_hitbox(bounds, HitboxBehavior::Normal));
+                        TerminalCanvasPrepaint { link_hover_hitbox }
+                    },
+                    move |bounds, prepaint, window, cx| {
                         *canvas_bounds_shared.lock() = Some(bounds);
                         window.handle_input(
                             &focus_handle,
@@ -216,6 +294,12 @@ impl Render for AgentTerminal {
                             .advance(font_id, font_pixels, 'M')
                             .map(|advance| advance.width)
                             .unwrap_or(px(8.0));
+                        let link_color: Hsla = rgb(0x6aa8ff).into();
+                        if let Some(hitbox) = prepaint.link_hover_hitbox.as_ref()
+                            && hitbox.is_hovered(window)
+                        {
+                            window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
+                        }
 
                         // Dynamically center terminal content vertically:
                         // distribute the fractional row remainder evenly to top and bottom.
@@ -253,9 +337,15 @@ impl Render for AgentTerminal {
                                 }
 
                                 if !is_spacer_col && cell.ch != ' ' {
+                                    let underline = cell.link.as_ref().map(|_| gpui::UnderlineStyle {
+                                        color: Some(link_color),
+                                        thickness: px(1.0),
+                                        wavy: false,
+                                    });
                                     let run = gpui::TextRun {
                                         len: cell.ch.len_utf8(),
-                                        color: cell.fg,
+                                        color: if cell.link.is_some() { link_color } else { cell.fg },
+                                        underline,
                                         ..run_template.clone()
                                     };
                                     let shaped = window.text_system().shape_line(

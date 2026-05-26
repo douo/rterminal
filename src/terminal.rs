@@ -141,6 +141,7 @@ pub(crate) struct CellSnapshot {
     pub(crate) ch: char,
     pub(crate) fg: gpui::Hsla,
     pub(crate) bg: Option<gpui::Hsla>,
+    pub(crate) link: Option<String>,
     pub(crate) width_cols: u8,
     pub(crate) spans_next_col: bool,
     pub(crate) expands_layout: bool,
@@ -152,6 +153,7 @@ impl Default for CellSnapshot {
             ch: ' ',
             fg: gpui::Hsla::default(),
             bg: None,
+            link: None,
             width_cols: 1,
             spans_next_col: false,
             expands_layout: false,
@@ -552,6 +554,7 @@ impl AgentTerminal {
                         true,
                     ),
                     bg: None,
+                    link: None,
                     width_cols: 1,
                     spans_next_col: false,
                     expands_layout: false,
@@ -597,11 +600,13 @@ impl AgentTerminal {
                 ch,
                 fg: ansi_to_hsla(fg, content.colors, indexed.cell.flags, true),
                 bg: ansi_bg_to_hsla(bg, content.colors),
+                link: indexed.cell.hyperlink().map(|link| link.uri().to_string()),
                 width_cols,
                 spans_next_col,
                 expands_layout,
             };
         }
+        annotate_plain_text_links(&mut cells);
 
         let cursor = content.cursor;
         let cursor_row = (cursor.point.line.0 + content.display_offset as i32).max(0) as usize;
@@ -733,6 +738,7 @@ impl AgentTerminal {
                     ch: ' ',
                     fg: default_fg,
                     bg: None,
+                    link: None,
                     width_cols: 1,
                     spans_next_col: false,
                     expands_layout: false,
@@ -766,11 +772,13 @@ impl AgentTerminal {
                     ch,
                     fg: ansi_to_hsla(fg, colors, cell.flags, true),
                     bg: ansi_bg_to_hsla(bg, colors),
+                    link: cell.hyperlink().map(|link| link.uri().to_string()),
                     width_cols,
                     spans_next_col,
                     expands_layout,
                 };
             }
+            annotate_plain_text_links_for_row(&mut row);
 
             lines.push(row);
         }
@@ -1094,6 +1102,80 @@ pub(crate) fn snapshot_to_lines(snapshot: &ScreenSnapshot) -> Vec<String> {
         .collect()
 }
 
+fn annotate_plain_text_links(cells: &mut [Vec<CellSnapshot>]) {
+    for row in cells {
+        annotate_plain_text_links_for_row(row);
+    }
+}
+
+fn annotate_plain_text_links_for_row(row: &mut [CellSnapshot]) {
+    let mut text = String::with_capacity(row.len());
+    for cell in row.iter() {
+        text.push(cell.ch);
+    }
+
+    for (start, end, uri) in find_plain_text_links(&text) {
+        for col in start..end.min(row.len()) {
+            if row[col].link.is_none() {
+                row[col].link = Some(uri.clone());
+            }
+        }
+    }
+}
+
+fn find_plain_text_links(text: &str) -> Vec<(usize, usize, String)> {
+    let mut links = Vec::new();
+    let mut search_start = 0usize;
+    while search_start < text.len() {
+        let Some((scheme_start, scheme)) = find_next_url_scheme(&text[search_start..]) else {
+            break;
+        };
+        let start = search_start + scheme_start;
+        let mut end = start + scheme.len();
+        for (offset, ch) in text[end..].char_indices() {
+            if is_url_body_char(ch) {
+                end = start + scheme.len() + offset + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        while end > start {
+            let Some(ch) = text[..end].chars().next_back() else {
+                break;
+            };
+            if is_url_trailing_punctuation(ch) {
+                end -= ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if end > start + scheme.len() {
+            let start_col = text[..start].chars().count();
+            let end_col = text[..end].chars().count();
+            links.push((start_col, end_col, text[start..end].to_string()));
+        }
+        search_start = end.max(start + scheme.len());
+    }
+    links
+}
+
+fn find_next_url_scheme(text: &str) -> Option<(usize, &'static str)> {
+    ["https://", "http://", "file://"]
+        .into_iter()
+        .filter_map(|scheme| text.find(scheme).map(|index| (index, scheme)))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn is_url_body_char(ch: char) -> bool {
+    !ch.is_whitespace() && !ch.is_control() && ch != '<' && ch != '>' && ch != '"' && ch != '\''
+}
+
+fn is_url_trailing_punctuation(ch: char) -> bool {
+    matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
+}
+
 fn is_input_trace_enabled() -> bool {
     std::env::var(INPUT_TRACE_ENV)
         .ok()
@@ -1230,6 +1312,31 @@ mod tests {
             PendingTerminalEvent::ClipboardLoad(ClipboardType::Clipboard, _) => {}
             _ => panic!("expected clipboard load event"),
         }
+    }
+
+    #[test]
+    fn plain_text_link_detection_trims_trailing_punctuation() {
+        let links = find_plain_text_links("open https://example.com/path?q=1). next");
+        assert_eq!(
+            links,
+            vec![(5, 33, "https://example.com/path?q=1".to_string())]
+        );
+    }
+
+    #[test]
+    fn plain_text_link_annotation_preserves_osc8_links() {
+        let mut row: Vec<CellSnapshot> = "go https://fallback.test".chars().map(|ch| {
+            CellSnapshot {
+                ch,
+                ..CellSnapshot::default()
+            }
+        }).collect();
+        row[3].link = Some("https://osc8.test".to_string());
+
+        annotate_plain_text_links_for_row(&mut row);
+
+        assert_eq!(row[3].link.as_deref(), Some("https://osc8.test"));
+        assert_eq!(row[4].link.as_deref(), Some("https://fallback.test"));
     }
 }
 

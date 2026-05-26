@@ -87,6 +87,8 @@ This is **not** intended to be a general-purpose terminal replacement. It is an 
 - Bracketed paste mode
 - Focus in/out events (`CSI I` / `CSI O`)
 - Terminal title tracking via OSC sequences
+- Clickable URL support: `Cmd`-click OSC 8 or visible `http://`, `https://`,
+  and `file://` links to open them in the default browser
 
 ### Input & Accessibility
 - Full keyboard input: printable text, Ctrl/Alt/Shift chords, function keys, special keys
@@ -193,7 +195,6 @@ cargo run -- --self-check
 - **Input-line model drift** — the shadow `input_line` can desynchronize from the actual shell state in complex scenarios (tmux prefix sequences, shell history navigation, tab completion)
 - **No scrollback UI** — terminal scrollback buffer exists in `alacritty_terminal` but is not yet exposed through scroll interaction
 - **No search** — no find-in-terminal functionality
-- **No hyperlink interaction** — OSC 8 hyperlinks are not yet clickable
 - **No bold/italic font variants** — text style flags are parsed but not rendered with distinct font faces
 
 ## License

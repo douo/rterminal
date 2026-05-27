@@ -1,9 +1,9 @@
+use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     Bounds, Context, ExternalPaths, Font, FontFallbacks, Hitbox, HitboxBehavior, Hsla, MouseButton,
     Pixels, Render, Window, WindowControlArea, canvas, div, fill, font, point, prelude::*, px, rgb,
     rgba, size,
 };
-use alacritty_terminal::vte::ansi::CursorShape;
 
 use crate::cli::Theme;
 use crate::input::selection_contains_cell;
@@ -82,7 +82,8 @@ fn link_hover_bounds(
         return None;
     }
 
-    let cell_width = measure_cell_width(window, font_family, font_fallbacks, font_size).max(px(1.0));
+    let cell_width =
+        measure_cell_width(window, font_family, font_fallbacks, font_size).max(px(1.0));
     let dynamic_padding_y =
         terminal_content_padding_y(bounds.size.height, line_height, snapshot.cells.len());
     let origin = bounds.origin + point(TEXT_PADDING_X, dynamic_padding_y);
@@ -108,7 +109,10 @@ fn link_hover_bounds(
             && raw_visual_col >= x_cols
             && raw_visual_col < x_cols + width_cols
         {
-            let cell_origin = point(origin.x + x_cols * cell_width, origin.y + row_index as f32 * line_height);
+            let cell_origin = point(
+                origin.x + x_cols * cell_width,
+                origin.y + row_index as f32 * line_height,
+            );
             return Some(Bounds::new(
                 cell_origin,
                 size(cell_width.max(px(2.0)) * width_cols, line_height),
@@ -276,8 +280,10 @@ impl Render for AgentTerminal {
                         );
                         window.paint_quad(fill(bounds, palette.terminal_bg));
 
-                        let mono =
-                            build_terminal_font(&canvas_font_family, canvas_font_fallbacks.as_ref());
+                        let mono = build_terminal_font(
+                            &canvas_font_family,
+                            canvas_font_fallbacks.as_ref(),
+                        );
                         let run_template = gpui::TextRun {
                             len: 0,
                             font: mono.clone(),
@@ -316,7 +322,8 @@ impl Render for AgentTerminal {
 
                             for (col_index, cell) in row.iter().enumerate() {
                                 let is_spacer_col = col_index < covered_until_col;
-                                let x = origin.x + (col_index as f32 + extra_visual_cols) * cell_width;
+                                let x =
+                                    origin.x + (col_index as f32 + extra_visual_cols) * cell_width;
                                 let cell_origin = point(x, y);
                                 let cell_width_px =
                                     cell_width.max(px(2.0)) * cell.width_cols as f32;
@@ -327,29 +334,37 @@ impl Render for AgentTerminal {
                                         bg,
                                     ));
                                 }
-                                if !is_spacer_col && selection.is_some_and(|(start, end)| {
-                                    selection_contains_cell(start, end, row_index, col_index)
-                                }) {
+                                if !is_spacer_col
+                                    && selection.is_some_and(|(start, end)| {
+                                        selection_contains_cell(start, end, row_index, col_index)
+                                    })
+                                {
                                     window.paint_quad(fill(
                                         Bounds::new(cell_origin, size(cell_width_px, line_height)),
                                         palette.selection_bg,
                                     ));
                                 }
 
-                                if !is_spacer_col && cell.ch != ' ' {
-                                    let underline = cell.link.as_ref().map(|_| gpui::UnderlineStyle {
-                                        color: Some(link_color),
-                                        thickness: px(1.0),
-                                        wavy: false,
-                                    });
+                                if !is_spacer_col && !cell.is_blank() {
+                                    let cell_text = cell.text();
+                                    let underline =
+                                        cell.link.as_ref().map(|_| gpui::UnderlineStyle {
+                                            color: Some(link_color),
+                                            thickness: px(1.0),
+                                            wavy: false,
+                                        });
                                     let run = gpui::TextRun {
-                                        len: cell.ch.len_utf8(),
-                                        color: if cell.link.is_some() { link_color } else { cell.fg },
+                                        len: cell_text.len(),
+                                        color: if cell.link.is_some() {
+                                            link_color
+                                        } else {
+                                            cell.fg
+                                        },
                                         underline,
                                         ..run_template.clone()
                                     };
                                     let shaped = window.text_system().shape_line(
-                                        cell.ch.to_string().into(),
+                                        cell_text.into(),
                                         font_pixels,
                                         &[run],
                                         Some(cell_width_px),
@@ -419,7 +434,8 @@ impl Render for AgentTerminal {
                         }
 
                         if focused && snapshot.cursor_visible && ime_marked_text.is_none() {
-                            let cursor_logical_col_floor = cursor_visual_col.max(0.0).floor() as usize;
+                            let cursor_logical_col_floor =
+                                cursor_visual_col.max(0.0).floor() as usize;
                             let cursor_extra_cols = snapshot
                                 .cells
                                 .get(cursor_visual_row)
@@ -441,11 +457,12 @@ impl Render for AgentTerminal {
                                                 CURSOR_TRAIL_MAX_LEN_CELLS,
                                             );
                                             let primary_trail_width = cell_width_px * trail_cells;
-                                            let primary_trail_origin_x = if delta_cols.is_sign_positive() {
-                                                cursor_origin.x - primary_trail_width
-                                            } else {
-                                                cursor_origin.x + beam_width
-                                            };
+                                            let primary_trail_origin_x =
+                                                if delta_cols.is_sign_positive() {
+                                                    cursor_origin.x - primary_trail_width
+                                                } else {
+                                                    cursor_origin.x + beam_width
+                                                };
                                             let mut primary_trail_color = palette.cursor_bg;
                                             primary_trail_color.a = (primary_trail_color.a
                                                 * CURSOR_TRAIL_PRIMARY_ALPHA_SCALE)
@@ -458,21 +475,28 @@ impl Render for AgentTerminal {
                                                 primary_trail_color,
                                             ));
 
-                                            let secondary_trail_width =
-                                                (primary_trail_width * CURSOR_TRAIL_SECONDARY_LEN_SCALE)
-                                                    .min(cell_width_px * (CURSOR_TRAIL_MAX_LEN_CELLS * 1.8));
-                                            let secondary_trail_origin_x = if delta_cols.is_sign_positive() {
-                                                cursor_origin.x - secondary_trail_width
-                                            } else {
-                                                cursor_origin.x + beam_width
-                                            };
+                                            let secondary_trail_width = (primary_trail_width
+                                                * CURSOR_TRAIL_SECONDARY_LEN_SCALE)
+                                                .min(
+                                                    cell_width_px
+                                                        * (CURSOR_TRAIL_MAX_LEN_CELLS * 1.8),
+                                                );
+                                            let secondary_trail_origin_x =
+                                                if delta_cols.is_sign_positive() {
+                                                    cursor_origin.x - secondary_trail_width
+                                                } else {
+                                                    cursor_origin.x + beam_width
+                                                };
                                             let mut secondary_trail_color = palette.cursor_bg;
                                             secondary_trail_color.a = (secondary_trail_color.a
                                                 * CURSOR_TRAIL_SECONDARY_ALPHA_SCALE)
                                                 .clamp(0.0, 1.0);
                                             window.paint_quad(fill(
                                                 Bounds::new(
-                                                    point(secondary_trail_origin_x, cursor_origin.y),
+                                                    point(
+                                                        secondary_trail_origin_x,
+                                                        cursor_origin.y,
+                                                    ),
                                                     size(secondary_trail_width, line_height),
                                                 ),
                                                 secondary_trail_color,
@@ -508,7 +532,10 @@ impl Render for AgentTerminal {
                                     ));
                                     window.paint_quad(fill(
                                         Bounds::new(
-                                            point(cursor_origin.x, cursor_origin.y + line_height - border_y),
+                                            point(
+                                                cursor_origin.x,
+                                                cursor_origin.y + line_height - border_y,
+                                            ),
                                             size(cell_width_px, border_y),
                                         ),
                                         palette.cursor_bg,
@@ -519,7 +546,10 @@ impl Render for AgentTerminal {
                                     ));
                                     window.paint_quad(fill(
                                         Bounds::new(
-                                            point(cursor_origin.x + cell_width_px - border_x, cursor_origin.y),
+                                            point(
+                                                cursor_origin.x + cell_width_px - border_x,
+                                                cursor_origin.y,
+                                            ),
                                             size(border_x, line_height),
                                         ),
                                         palette.cursor_bg,
@@ -528,7 +558,10 @@ impl Render for AgentTerminal {
                                 CursorShape::Hidden => {}
                                 CursorShape::Block => {
                                     window.paint_quad(fill(
-                                        Bounds::new(cursor_origin, size(cell_width_px, line_height)),
+                                        Bounds::new(
+                                            cursor_origin,
+                                            size(cell_width_px, line_height),
+                                        ),
                                         palette.cursor_bg,
                                     ));
                                 }

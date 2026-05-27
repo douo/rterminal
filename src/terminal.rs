@@ -1,5 +1,5 @@
-use std::io::Write;
 use std::collections::HashSet;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,8 +14,8 @@ use alacritty_terminal::vte::ansi::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, FontFallbacks, Pixels,
-    Subscription, Task, Window, px,
+    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, FontFallbacks, Pixels, Subscription,
+    Task, Window, px,
 };
 use parking_lot::Mutex;
 use portable_pty::{Child, MasterPty, PtySize};
@@ -26,12 +26,13 @@ use crate::cli::{AmbiguousWidth, CliOptions, Theme};
 use crate::color::indexed_to_rgb;
 use crate::color::{ansi_bg_to_hsla, ansi_to_hsla};
 use crate::debug_server::{SharedDebugState, start_debug_http_server};
+use crate::font_fallback::font_fallback_families;
 use crate::input_log::InputLogger;
 use crate::keyboard::encode_keystroke;
 use crate::pty::{PtySession, SharedPtyWriter, write_to_pty};
 use crate::render::{
-    CUSTOM_TITLE_BAR_HEIGHT, STATUS_BAR_HEIGHT, TEXT_PADDING_X, TEXT_PADDING_Y,
-    line_height_for, measure_cell_width,
+    CUSTOM_TITLE_BAR_HEIGHT, STATUS_BAR_HEIGHT, TEXT_PADDING_X, TEXT_PADDING_Y, line_height_for,
+    measure_cell_width,
 };
 use crate::snapshot_tab::SnapshotTabData;
 use crate::text_utils::summarize_text_for_trace;
@@ -97,7 +98,10 @@ impl Dimensions for GridSize {
 #[derive(Clone)]
 enum PendingTerminalEvent {
     ClipboardStore(ClipboardType, String),
-    ClipboardLoad(ClipboardType, Arc<dyn Fn(&str) -> String + Sync + Send + 'static>),
+    ClipboardLoad(
+        ClipboardType,
+        Arc<dyn Fn(&str) -> String + Sync + Send + 'static>,
+    ),
 }
 
 #[derive(Clone)]
@@ -139,6 +143,7 @@ impl EventListener for TitleTrackingListener {
 #[derive(Clone)]
 pub(crate) struct CellSnapshot {
     pub(crate) ch: char,
+    pub(crate) zerowidth: Vec<char>,
     pub(crate) fg: gpui::Hsla,
     pub(crate) bg: Option<gpui::Hsla>,
     pub(crate) link: Option<String>,
@@ -151,6 +156,7 @@ impl Default for CellSnapshot {
     fn default() -> Self {
         Self {
             ch: ' ',
+            zerowidth: Vec::new(),
             fg: gpui::Hsla::default(),
             bg: None,
             link: None,
@@ -158,6 +164,25 @@ impl Default for CellSnapshot {
             spans_next_col: false,
             expands_layout: false,
         }
+    }
+}
+
+impl CellSnapshot {
+    pub(crate) fn push_text_to(&self, text: &mut String) {
+        text.push(self.ch);
+        text.extend(self.zerowidth.iter().copied());
+    }
+
+    pub(crate) fn text(&self) -> String {
+        let mut text = String::with_capacity(
+            self.ch.len_utf8() + self.zerowidth.iter().map(|ch| ch.len_utf8()).sum::<usize>(),
+        );
+        self.push_text_to(&mut text);
+        text
+    }
+
+    pub(crate) fn is_blank(&self) -> bool {
+        self.ch == ' ' && self.zerowidth.is_empty()
     }
 }
 
@@ -275,12 +300,8 @@ impl AgentTerminal {
         let font_size = DEFAULT_FONT_SIZE;
         let font_fallbacks = parse_font_fallbacks(&cli.font_fallbacks);
         let forced_double_width_chars = parse_double_width_chars(&cli.double_width_chars);
-        let cell_width = measure_cell_width(
-            window,
-            &cli.font_family,
-            font_fallbacks.as_ref(),
-            font_size,
-        );
+        let cell_width =
+            measure_cell_width(window, &cli.font_family, font_fallbacks.as_ref(), font_size);
         let viewport = window.viewport_size();
         let grid_size = compute_grid_size(
             viewport,
@@ -420,16 +441,21 @@ impl AgentTerminal {
             this.sync_grid_to_window(window);
             cx.notify();
         }));
-        this._focus_in_sub = Some(cx.on_focus(&this.focus_handle, window, |this, _window, _cx| {
-            if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
-                this.write_bytes(b"\x1b[I");
-            }
-        }));
-        this._focus_out_sub = Some(cx.on_focus_out(&this.focus_handle, window, |this, _event, _window, _cx| {
-            if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
-                this.write_bytes(b"\x1b[O");
-            }
-        }));
+        this._focus_in_sub = Some(
+            cx.on_focus(&this.focus_handle, window, |this, _window, _cx| {
+                if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+                    this.write_bytes(b"\x1b[I");
+                }
+            }),
+        );
+        this._focus_out_sub =
+            Some(
+                cx.on_focus_out(&this.focus_handle, window, |this, _event, _window, _cx| {
+                    if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+                        this.write_bytes(b"\x1b[O");
+                    }
+                }),
+            );
         this.sync_grid_to_window(window);
 
         if let Some(rx) = output_rx {
@@ -522,11 +548,7 @@ impl AgentTerminal {
             .set_note(Some(format!("osc52 copied to {clipboard:?}")));
     }
 
-    fn load_osc52_clipboard(
-        &mut self,
-        cx: &mut Context<Self>,
-        clipboard: ClipboardType,
-    ) -> String {
+    fn load_osc52_clipboard(&mut self, cx: &mut Context<Self>, clipboard: ClipboardType) -> String {
         let text = match clipboard {
             ClipboardType::Clipboard => cx.read_from_clipboard().and_then(|item| item.text()),
             ClipboardType::Selection => cx.read_from_clipboard().and_then(|item| item.text()),
@@ -548,6 +570,7 @@ impl AgentTerminal {
             vec![
                 CellSnapshot {
                     ch: ' ',
+                    zerowidth: Vec::new(),
                     fg: ansi_to_hsla(
                         AnsiColor::Named(NamedColor::Foreground),
                         content.colors,
@@ -592,13 +615,22 @@ impl AgentTerminal {
             } else {
                 indexed.cell.c
             };
+            let zerowidth = if indexed.cell.flags.contains(Flags::HIDDEN) {
+                Vec::new()
+            } else {
+                indexed.cell.zerowidth().unwrap_or(&[]).to_vec()
+            };
             let spans_next_col = indexed.cell.flags.contains(Flags::WIDE_CHAR);
-            let expands_layout =
-                !spans_next_col && self.forced_double_width_chars.contains(&ch);
-            let width_cols = if spans_next_col || expands_layout { 2 } else { 1 };
+            let expands_layout = !spans_next_col && self.forced_double_width_chars.contains(&ch);
+            let width_cols = if spans_next_col || expands_layout {
+                2
+            } else {
+                1
+            };
 
             cells[row][col] = CellSnapshot {
                 ch,
+                zerowidth,
                 fg: ansi_to_hsla(fg, content.colors, indexed.cell.flags, true),
                 bg: ansi_bg_to_hsla(bg, content.colors),
                 link: indexed.cell.hyperlink().map(|link| link.uri().to_string()),
@@ -612,12 +644,12 @@ impl AgentTerminal {
         let cursor = content.cursor;
         let cursor_row = (cursor.point.line.0 + content.display_offset as i32).max(0) as usize;
         let cursor_col = cursor.point.column.0.min(cols.saturating_sub(1));
-        let effective_cursor_shape = if self.force_vertical_cursor && cursor.shape != CursorShape::Hidden
-        {
-            CursorShape::Beam
-        } else {
-            cursor.shape
-        };
+        let effective_cursor_shape =
+            if self.force_vertical_cursor && cursor.shape != CursorShape::Hidden {
+                CursorShape::Beam
+            } else {
+                cursor.shape
+            };
         self.cursor_shape = effective_cursor_shape;
         self.update_cursor_visual_target(cursor_row.min(rows.saturating_sub(1)), cursor_col);
 
@@ -737,6 +769,7 @@ impl AgentTerminal {
             let mut row = vec![
                 CellSnapshot {
                     ch: ' ',
+                    zerowidth: Vec::new(),
                     fg: default_fg,
                     bg: None,
                     link: None,
@@ -764,13 +797,23 @@ impl AgentTerminal {
                 } else {
                     cell.c
                 };
+                let zerowidth = if cell.flags.contains(Flags::HIDDEN) {
+                    Vec::new()
+                } else {
+                    cell.zerowidth().unwrap_or(&[]).to_vec()
+                };
                 let spans_next_col = cell.flags.contains(Flags::WIDE_CHAR);
                 let expands_layout =
                     !spans_next_col && self.forced_double_width_chars.contains(&ch);
-                let width_cols = if spans_next_col || expands_layout { 2 } else { 1 };
+                let width_cols = if spans_next_col || expands_layout {
+                    2
+                } else {
+                    1
+                };
 
                 row[col] = CellSnapshot {
                     ch,
+                    zerowidth,
                     fg: ansi_to_hsla(fg, colors, cell.flags, true),
                     bg: ansi_bg_to_hsla(bg, colors),
                     link: cell.hyperlink().map(|link| link.uri().to_string()),
@@ -797,11 +840,19 @@ impl AgentTerminal {
 
     pub(crate) fn cursor_visual_state(&self) -> (usize, f32, bool) {
         if !self.cursor_slide_enabled {
-            return (self.snapshot.cursor_row, self.snapshot.cursor_col as f32, false);
+            return (
+                self.snapshot.cursor_row,
+                self.snapshot.cursor_col as f32,
+                false,
+            );
         }
 
         if !self.cursor_visual_initialized {
-            return (self.snapshot.cursor_row, self.snapshot.cursor_col as f32, false);
+            return (
+                self.snapshot.cursor_row,
+                self.snapshot.cursor_col as f32,
+                false,
+            );
         }
 
         let now = Instant::now();
@@ -946,7 +997,13 @@ impl AgentTerminal {
 
         probe.first_pty_at = Some(now);
         let snapshot = probe.clone();
-        self.log_enter_latency_event("enter_latency_first_pty", snapshot.id, &snapshot, now, json!({}));
+        self.log_enter_latency_event(
+            "enter_latency_first_pty",
+            snapshot.id,
+            &snapshot,
+            now,
+            json!({}),
+        );
     }
 
     pub(crate) fn mark_enter_latency_first_paint(&mut self) {
@@ -959,7 +1016,13 @@ impl AgentTerminal {
             return;
         }
 
-        self.log_enter_latency_event("enter_latency_first_paint", probe.id, &probe, now, json!({}));
+        self.log_enter_latency_event(
+            "enter_latency_first_paint",
+            probe.id,
+            &probe,
+            now,
+            json!({}),
+        );
     }
 
     fn log_enter_latency_event(
@@ -1094,7 +1157,7 @@ pub(crate) fn snapshot_to_lines(snapshot: &ScreenSnapshot) -> Vec<String> {
         .cells
         .iter()
         .map(|row| {
-            let mut line: String = row.iter().map(|cell| cell.ch).collect();
+            let mut line = row_text_without_wide_spacers(row);
             while line.ends_with(' ') {
                 line.pop();
             }
@@ -1111,14 +1174,22 @@ fn annotate_plain_text_links(cells: &mut [Vec<CellSnapshot>]) {
 
 fn annotate_plain_text_links_for_row(row: &mut [CellSnapshot]) {
     let mut text = String::with_capacity(row.len());
-    for cell in row.iter() {
-        text.push(cell.ch);
+    let mut char_cols = Vec::with_capacity(row.len());
+    let mut col = 0usize;
+    while col < row.len() {
+        let cell = &row[col];
+        let before = text.chars().count();
+        cell.push_text_to(&mut text);
+        let after = text.chars().count();
+        char_cols.extend(std::iter::repeat_n(col, after.saturating_sub(before)));
+        col = col.saturating_add(cell_advance_cols(cell));
     }
 
     for (start, end, uri) in find_plain_text_links(&text) {
-        for col in start..end.min(row.len()) {
-            if row[col].link.is_none() {
-                row[col].link = Some(uri.clone());
+        for text_col in start..end.min(char_cols.len()) {
+            let cell_col = char_cols[text_col];
+            if row[cell_col].link.is_none() {
+                row[cell_col].link = Some(uri.clone());
             }
         }
     }
@@ -1188,17 +1259,31 @@ fn is_input_trace_enabled() -> bool {
 }
 
 fn parse_font_fallbacks(raw: &[String]) -> Option<FontFallbacks> {
-    let fallbacks: Vec<String> = raw
-        .iter()
-        .map(|font| font.trim())
-        .filter(|font| !font.is_empty())
-        .map(|font| font.to_string())
-        .collect();
+    let fallbacks = font_fallback_families(raw);
     if fallbacks.is_empty() {
         None
     } else {
         Some(FontFallbacks::from_fonts(fallbacks))
     }
+}
+
+fn cell_advance_cols(cell: &CellSnapshot) -> usize {
+    if cell.spans_next_col {
+        usize::from(cell.width_cols.max(1))
+    } else {
+        1
+    }
+}
+
+fn row_text_without_wide_spacers(row: &[CellSnapshot]) -> String {
+    let mut text = String::new();
+    let mut col = 0usize;
+    while col < row.len() {
+        let cell = &row[col];
+        cell.push_text_to(&mut text);
+        col = col.saturating_add(cell_advance_cols(cell));
+    }
+    text
 }
 
 fn parse_double_width_chars(raw: &[String]) -> HashSet<char> {
@@ -1211,8 +1296,8 @@ fn parse_double_width_chars(raw: &[String]) -> HashSet<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Result as IoResult, Write};
     use alacritty_terminal::term::Osc52;
+    use std::io::{Result as IoResult, Write};
 
     struct RecordingWriter {
         bytes: Arc<Mutex<Vec<u8>>>,
@@ -1458,18 +1543,69 @@ mod tests {
 
     #[test]
     fn plain_text_link_annotation_preserves_osc8_links() {
-        let mut row: Vec<CellSnapshot> = "go https://fallback.test".chars().map(|ch| {
-            CellSnapshot {
+        let mut row: Vec<CellSnapshot> = "go https://fallback.test"
+            .chars()
+            .map(|ch| CellSnapshot {
                 ch,
                 ..CellSnapshot::default()
-            }
-        }).collect();
+            })
+            .collect();
         row[3].link = Some("https://osc8.test".to_string());
 
         annotate_plain_text_links_for_row(&mut row);
 
         assert_eq!(row[3].link.as_deref(), Some("https://osc8.test"));
         assert_eq!(row[4].link.as_deref(), Some("https://fallback.test"));
+    }
+
+    #[test]
+    fn snapshot_to_lines_preserves_cell_zerowidth_sequence() {
+        let snapshot = ScreenSnapshot {
+            cells: vec![vec![
+                CellSnapshot {
+                    ch: '\u{1f4c1}',
+                    zerowidth: vec!['\u{fe0f}'],
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot {
+                    ch: ' ',
+                    ..CellSnapshot::default()
+                },
+            ]],
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            alt_screen: false,
+        };
+
+        assert_eq!(snapshot_to_lines(&snapshot), vec!["\u{1f4c1}\u{fe0f}"]);
+    }
+
+    #[test]
+    fn font_fallbacks_keep_user_fonts_first_and_deduped() {
+        let fallbacks = parse_font_fallbacks(&[
+            "Custom Symbols".to_string(),
+            "Apple Color Emoji".to_string(),
+            "custom symbols".to_string(),
+        ])
+        .expect("fallbacks");
+        let fallback_list = fallbacks.fallback_list();
+
+        assert_eq!(
+            fallback_list.get(0).map(String::as_str),
+            Some("Custom Symbols")
+        );
+        assert_eq!(
+            fallback_list.get(1).map(String::as_str),
+            Some("Apple Color Emoji")
+        );
+        assert_eq!(
+            fallback_list
+                .iter()
+                .filter(|font| font.eq_ignore_ascii_case("Custom Symbols"))
+                .count(),
+            1
+        );
     }
 }
 

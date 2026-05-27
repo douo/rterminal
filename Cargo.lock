@@ -38,6 +38,7 @@ dependencies = [
  "async-channel 2.5.0",
  "clap",
  "cocoa",
+ "fontdb",
  "gpui",
  "gpui_platform",
  "objc",
@@ -47,6 +48,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tiny_http",
+ "ttf-parser",
 ]
 
 [[package]]

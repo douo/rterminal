@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::TermMode;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, InputHandler, KeyDownEvent, KeyUpEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PromptLevel, ScrollDelta,
-    ScrollWheelEvent, UTF16Selection, Window, point, px, size,
+    App, Bounds, ClipboardItem, Context, EntityInputHandler, InputHandler, KeyDownEvent,
+    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PromptLevel,
+    ScrollDelta, ScrollWheelEvent, UTF16Selection, Window, point, px, size,
 };
 use serde_json::json;
 
@@ -17,8 +17,8 @@ use crate::keyboard::{
 };
 use crate::macos_ax::NativeAxInputState;
 use crate::render::{
-    CUSTOM_TITLE_BAR_HEIGHT, STATUS_BAR_HEIGHT, TEXT_PADDING_X,
-    measure_cell_width, terminal_content_padding_y,
+    CUSTOM_TITLE_BAR_HEIGHT, STATUS_BAR_HEIGHT, TEXT_PADDING_X, measure_cell_width,
+    terminal_content_padding_y,
 };
 use crate::terminal::{CellSnapshot, ScreenSnapshot, SelectionPoint};
 use crate::text_utils::{
@@ -722,10 +722,8 @@ impl AgentTerminal {
             } else {
                 px(0.0)
             };
-            let surface_height = (window.viewport_size().height
-                - title_bar_height
-                - status_height)
-                .max(line_height);
+            let surface_height =
+                (window.viewport_size().height - title_bar_height - status_height).max(line_height);
             point(
                 TEXT_PADDING_X,
                 title_bar_height
@@ -1091,11 +1089,7 @@ impl AgentTerminal {
     fn current_selection_text(&self) -> Option<String> {
         let (start, end) = self.selection_bounds()?;
         let text = extract_selection_text(&self.snapshot, start, end);
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 
     fn copy_current_selection_to_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1159,7 +1153,7 @@ impl AgentTerminal {
             if col_index < covered_until_col {
                 continue;
             }
-            row_before_cursor.push(cell.ch);
+            cell.push_text_to(&mut row_before_cursor);
             covered_until_col = col_index.saturating_add(cell_advance_cols(cell));
         }
 
@@ -1455,7 +1449,7 @@ fn extract_selection_text(
         let mut col = line_start;
         while col <= clamped_end {
             let cell = &cells[col];
-            text.push(cell.ch);
+            cell.push_text_to(&mut text);
             let step = cell_advance_cols(cell);
             col = col.saturating_add(step);
         }
@@ -1491,7 +1485,7 @@ fn row_text_without_wide_spacers(cells: &[CellSnapshot]) -> String {
     let mut col = 0usize;
     while col < cells.len() {
         let cell = &cells[col];
-        text.push(cell.ch);
+        cell.push_text_to(&mut text);
         col = col.saturating_add(cell_advance_cols(cell));
     }
     text
@@ -1634,10 +1628,7 @@ impl EntityInputHandler for AgentTerminal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.trace_input(format!(
-            "ime replace_and_mark_text len={}",
-            new_text.len()
-        ));
+        self.trace_input(format!("ime replace_and_mark_text len={}", new_text.len()));
         self.ime_marked_text = if new_text.is_empty() {
             None
         } else {
@@ -1685,8 +1676,9 @@ mod tests {
     use crate::terminal::CellSnapshot;
 
     use super::{
-        dropped_paths_text, evaluate_paste_risk, extract_selection_text, normalize_selection_bounds,
-        probable_ascii_prefix_noise, selection_contains_cell, shell_escape_path,
+        dropped_paths_text, evaluate_paste_risk, extract_selection_text,
+        normalize_selection_bounds, probable_ascii_prefix_noise, selection_contains_cell,
+        shell_escape_path,
     };
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
 
@@ -1776,6 +1768,29 @@ mod tests {
     }
 
     #[test]
+    fn extract_selection_text_preserves_cell_zerowidth_sequence() {
+        let snapshot = ScreenSnapshot {
+            cells: vec![vec![
+                cell('A'),
+                cell_with_zerowidth('\u{1f4c1}', vec!['\u{fe0f}']),
+                cell('B'),
+            ]],
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            alt_screen: false,
+        };
+
+        let text = extract_selection_text(
+            &snapshot,
+            SelectionPoint { row: 0, col: 0 },
+            SelectionPoint { row: 0, col: 2 },
+        );
+
+        assert_eq!(text, "A\u{1f4c1}\u{fe0f}B");
+    }
+
+    #[test]
     fn terminal_padding_matches_single_row_floor() {
         let padding = terminal_content_padding_y(px(100.0), px(18.0), 1);
         assert_eq!(padding, px(41.0));
@@ -1819,6 +1834,14 @@ mod tests {
             ch,
             width_cols: 2,
             spans_next_col: true,
+            ..CellSnapshot::default()
+        }
+    }
+
+    fn cell_with_zerowidth(ch: char, zerowidth: Vec<char>) -> CellSnapshot {
+        CellSnapshot {
+            ch,
+            zerowidth,
             ..CellSnapshot::default()
         }
     }

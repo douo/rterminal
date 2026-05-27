@@ -114,7 +114,11 @@ impl SnapshotTab {
         }
     }
 
-    fn mouse_grid_point(&self, position: gpui::Point<Pixels>, window: &mut Window) -> SelectionPoint {
+    fn mouse_grid_point(
+        &self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+    ) -> SelectionPoint {
         let cell_width = measure_cell_width(
             window,
             &self.font_family,
@@ -124,11 +128,10 @@ impl SnapshotTab {
         .max(px(1.0));
         let line_height = self.line_height().max(px(1.0));
         let origin = point(TEXT_PADDING_X, TEXT_PADDING_Y);
-        let raw_col =
-            (f32::from(position.x - origin.x) / f32::from(cell_width)).floor() as i32;
-        let raw_row =
-            (f32::from(position.y - origin.y) / f32::from(line_height)).floor() as i32;
-        let max_row = (self.visible_rows_for_height(window.viewport_size().height) as i32).max(1) - 1;
+        let raw_col = (f32::from(position.x - origin.x) / f32::from(cell_width)).floor() as i32;
+        let raw_row = (f32::from(position.y - origin.y) / f32::from(line_height)).floor() as i32;
+        let max_row =
+            (self.visible_rows_for_height(window.viewport_size().height) as i32).max(1) - 1;
         let visible_row = raw_row.clamp(0, max_row) as usize;
         let max_col = (self.cols as i32).max(1) - 1;
         let col = raw_col.clamp(0, max_col) as usize;
@@ -148,11 +151,7 @@ impl SnapshotTab {
     fn selection_text(&self) -> Option<String> {
         let (start, end) = self.selection_bounds()?;
         let text = extract_selection_text(&self.lines, start, end);
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 
     fn copy_selection_to_clipboard(&self, cx: &mut Context<Self>) -> bool {
@@ -351,7 +350,8 @@ impl Render for SnapshotTab {
 
                         let origin = bounds.origin + point(TEXT_PADDING_X, TEXT_PADDING_Y);
                         let visible_rows = {
-                            let usable = (bounds.size.height - (TEXT_PADDING_Y * 2.0)).max(line_height);
+                            let usable =
+                                (bounds.size.height - (TEXT_PADDING_Y * 2.0)).max(line_height);
                             ((usable / line_height).floor() as usize).max(1)
                         };
                         let max_top = snapshot_lines.len().saturating_sub(visible_rows);
@@ -370,13 +370,17 @@ impl Render for SnapshotTab {
                                     .cloned()
                                     .unwrap_or_default();
                                 let is_spacer_col = col_index < covered_until_col;
-                                let x = origin.x + (col_index as f32 + extra_visual_cols) * cell_width;
+                                let x =
+                                    origin.x + (col_index as f32 + extra_visual_cols) * cell_width;
                                 let cell_origin = point(x, y);
                                 let cell_width_px = cell_width * cell.width_cols as f32;
 
                                 if !is_spacer_col && let Some(bg) = cell.bg {
                                     window.paint_quad(fill(
-                                        gpui::Bounds::new(cell_origin, size(cell_width_px, line_height)),
+                                        gpui::Bounds::new(
+                                            cell_origin,
+                                            size(cell_width_px, line_height),
+                                        ),
                                         bg,
                                     ));
                                 }
@@ -386,19 +390,23 @@ impl Render for SnapshotTab {
                                     })
                                 {
                                     window.paint_quad(fill(
-                                        gpui::Bounds::new(cell_origin, size(cell_width_px, line_height)),
+                                        gpui::Bounds::new(
+                                            cell_origin,
+                                            size(cell_width_px, line_height),
+                                        ),
                                         palette.selection_bg,
                                     ));
                                 }
 
-                                if !is_spacer_col && cell.ch != ' ' {
+                                if !is_spacer_col && !cell.is_blank() {
+                                    let cell_text = cell.text();
                                     let run = gpui::TextRun {
-                                        len: cell.ch.len_utf8(),
+                                        len: cell_text.len(),
                                         color: cell.fg,
                                         ..run_template.clone()
                                     };
                                     let shaped = window.text_system().shape_line(
-                                        cell.ch.to_string().into(),
+                                        cell_text.into(),
                                         font_size,
                                         &[run],
                                         Some(cell_width_px),
@@ -414,7 +422,8 @@ impl Render for SnapshotTab {
                                 }
 
                                 if !is_spacer_col {
-                                    covered_until_col = col_index.saturating_add(cell_advance_cols(&cell));
+                                    covered_until_col =
+                                        col_index.saturating_add(cell_advance_cols(&cell));
                                     if cell.expands_layout && cell.width_cols > 1 {
                                         extra_visual_cols += f32::from(cell.width_cols - 1);
                                     }
@@ -513,7 +522,7 @@ fn extract_selection_text(
         let mut col = line_start;
         while col <= clamped_end {
             let cell = &cells[col];
-            text.push(cell.ch);
+            cell.push_text_to(&mut text);
             col = col.saturating_add(cell_advance_cols(cell));
         }
         let trimmed_len = text.trim_end().len();
@@ -528,7 +537,7 @@ fn row_text_without_wide_spacers(cells: &[CellSnapshot]) -> String {
     let mut col = 0usize;
     while col < cells.len() {
         let cell = &cells[col];
-        text.push(cell.ch);
+        cell.push_text_to(&mut text);
         col = col.saturating_add(cell_advance_cols(cell));
     }
     text

@@ -15,11 +15,32 @@ const SYMBOL_PROBES: &[char] = &[
     '\u{2713}', '\u{26a0}', '\u{2190}', '\u{2192}', '\u{2318}', '\u{25cf}', '\u{25cb}',
 ];
 
+const CJK_TEXT_PROBES: &[char] = &[
+    '\u{4e2d}', // CJK ideograph: 中
+    '\u{6587}', // CJK ideograph: 文
+    '\u{4f60}', // CJK ideograph: 你
+    '\u{597d}', // CJK ideograph: 好
+    '\u{570b}', // CJK ideograph: 國
+    '\u{6f22}', // CJK ideograph: 漢
+    '\u{3042}', // Hiragana: あ
+    '\u{30a2}', // Katakana: ア
+    '\u{ac00}', // Hangul: 가
+    '\u{d55c}', // Hangul: 한
+];
+
 #[derive(Clone, Debug)]
 struct FontCandidate {
     family: String,
     score: i32,
     tie_breaker: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlyphCoverageHits {
+    pua: i32,
+    emoji: i32,
+    symbol: i32,
+    cjk_text: i32,
 }
 
 pub(crate) fn font_fallback_families(raw: &[String]) -> Vec<String> {
@@ -164,18 +185,23 @@ fn family_name_score(family: &str, monospaced: bool) -> i32 {
 fn glyph_coverage_score(db: &fontdb::Database, id: fontdb::ID) -> Option<(i32, i32)> {
     db.with_face_data(id, |data, face_index| {
         let face = ttf_parser::Face::parse(data, face_index).ok()?;
-        let pua_hits = count_glyph_hits(&face, PUA_PROBES);
-        let emoji_hits = count_glyph_hits(&face, EMOJI_PROBES);
-        let symbol_hits = count_glyph_hits(&face, SYMBOL_PROBES);
-
-        if pua_hits == 0 && emoji_hits == 0 && symbol_hits < 3 {
-            return None;
-        }
-
-        let score = pua_hits * 90 + emoji_hits * 70 + symbol_hits * 20;
-        let tie_breaker = pua_hits * 100 + emoji_hits * 20 + symbol_hits;
-        Some((score, tie_breaker))
+        terminal_symbol_coverage_score(GlyphCoverageHits {
+            pua: count_glyph_hits(&face, PUA_PROBES),
+            emoji: count_glyph_hits(&face, EMOJI_PROBES),
+            symbol: count_glyph_hits(&face, SYMBOL_PROBES),
+            cjk_text: count_glyph_hits(&face, CJK_TEXT_PROBES),
+        })
     })?
+}
+
+fn terminal_symbol_coverage_score(hits: GlyphCoverageHits) -> Option<(i32, i32)> {
+    if hits.cjk_text > 0 || (hits.pua == 0 && hits.emoji == 0 && hits.symbol < 3) {
+        return None;
+    }
+
+    let score = hits.pua * 90 + hits.emoji * 70 + hits.symbol * 20;
+    let tie_breaker = hits.pua * 100 + hits.emoji * 20 + hits.symbol;
+    Some((score, tie_breaker))
 }
 
 fn count_glyph_hits(face: &ttf_parser::Face<'_>, probes: &[char]) -> i32 {
@@ -199,7 +225,10 @@ fn face_style_tie_breaker(face: &fontdb::FaceInfo) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{family_name_score, merge_font_fallback_families};
+    use super::{
+        GlyphCoverageHits, family_name_score, merge_font_fallback_families,
+        terminal_symbol_coverage_score,
+    };
 
     #[test]
     fn merge_font_fallback_families_keeps_user_fonts_first_and_dedupes() {
@@ -234,5 +263,35 @@ mod tests {
         );
         assert!(family_name_score("Apple Color Emoji", false) > family_name_score("Arial", false));
         assert!(family_name_score("SF Symbols", false) > family_name_score("Times", false));
+    }
+
+    #[test]
+    fn terminal_symbol_coverage_score_rejects_cjk_text_fonts() {
+        let cjk_font_with_symbol_coverage = GlyphCoverageHits {
+            pua: 0,
+            emoji: 0,
+            symbol: 7,
+            cjk_text: 1,
+        };
+
+        assert_eq!(
+            terminal_symbol_coverage_score(cjk_font_with_symbol_coverage),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_symbol_coverage_score_keeps_symbol_only_fonts() {
+        let symbol_font = GlyphCoverageHits {
+            pua: 1,
+            emoji: 0,
+            symbol: 2,
+            cjk_text: 0,
+        };
+
+        assert_eq!(
+            terminal_symbol_coverage_score(symbol_font),
+            Some((130, 102))
+        );
     }
 }

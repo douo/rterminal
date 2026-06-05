@@ -118,11 +118,12 @@ This is **not** intended to be a general-purpose terminal replacement. It is an 
 - Option key behavior: Meta/Alt (default) or native macOS character input (`--no-option-as-meta`)
 
 ### Debugging & Observability
-- HTTP debug server on `localhost:7878` (auto-increments port per tab)
+- Local HTTP debug server on `127.0.0.1:37878-37977` (auto-selects the next available port per tab)
 - `GET /debug/state` — JSON snapshot of terminal state, counters, uptime
 - `GET /debug/screen` — plain-text dump of visible terminal content
 - `POST /debug/input` — inject raw bytes into PTY
 - `POST /debug/replace-line` — replace current shell input line
+- `AGENT_TUI_DEBUG_ADDR=127.0.0.1:<port>` — force a specific debug server address
 - Input event tracing: `AGENT_TUI_INPUT_TRACE=1`
 - Structured JSONL input logging: `--input-log-file <path>` (with optional `--input-log-raw`)
 

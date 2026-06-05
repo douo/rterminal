@@ -24,8 +24,8 @@
 - **方案**: 计算字符实际列宽（wcwidth），按列数发送左箭头
 
 ### 5. HTTP 调试接口安全加固
-- **位置**: `src/main.rs:1496-1504`
-- **问题**: 默认启动并监听 localhost:7878，`/debug/input` 可注入任意字节
+- **位置**: `src/debug_server.rs`
+- **问题**: 默认启动并监听本机 debug HTTP 端口，`/debug/input` 可注入任意字节
 - **方案**: 默认不启动，需 `--debug-http` 显式开启；或增加 token 认证
 
 ## 低优先级

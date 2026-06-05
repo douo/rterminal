@@ -1,6 +1,6 @@
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -8,13 +8,14 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tiny_http::{Header, Response, Server, StatusCode};
 
-use crate::GridSize;
 use crate::pty::write_to_pty;
+use crate::GridSize;
 
 const DEBUG_HTTP_DEFAULT_HOST: &str = "127.0.0.1";
-const DEBUG_HTTP_DEFAULT_PORT: u16 = 7878;
+const DEBUG_HTTP_DEFAULT_PORT_START: u16 = 37878;
+const DEBUG_HTTP_DEFAULT_PORT_END: u16 = 37977;
 const DEBUG_HTTP_LOG_ENV: &str = "AGENT_TUI_DEBUG_HTTP_LOG";
-static NEXT_DEBUG_HTTP_PORT: AtomicU16 = AtomicU16::new(DEBUG_HTTP_DEFAULT_PORT);
+static NEXT_DEBUG_HTTP_PORT: AtomicU16 = AtomicU16::new(DEBUG_HTTP_DEFAULT_PORT_START);
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct DebugCounters {
@@ -190,14 +191,67 @@ pub(crate) fn start_debug_http_server(
     debug: SharedDebugState,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
 ) {
-    let addr = std::env::var("AGENT_TUI_DEBUG_ADDR")
+    if let Some(addr) = std::env::var("AGENT_TUI_DEBUG_ADDR")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            let port = NEXT_DEBUG_HTTP_PORT.fetch_add(1, Ordering::Relaxed);
-            format!("{DEBUG_HTTP_DEFAULT_HOST}:{port}")
+    {
+        start_debug_http_server_at_addr(debug, writer, addr);
+        return;
+    }
+
+    start_debug_http_server_on_default_port_range(debug, writer);
+}
+
+fn start_debug_http_server_on_default_port_range(
+    debug: SharedDebugState,
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+) {
+    let _ = thread::Builder::new()
+        .name("agent-debug-http".to_string())
+        .spawn(move || {
+            let mut last_error = None;
+            for _ in DEBUG_HTTP_DEFAULT_PORT_START..=DEBUG_HTTP_DEFAULT_PORT_END {
+                let addr = next_default_debug_http_addr();
+                match Server::http(&addr) {
+                    Ok(server) => {
+                        serve_debug_http(server, debug, writer, addr);
+                        return;
+                    }
+                    Err(err) => {
+                        last_error = Some(format!("failed to start debug server on {addr}: {err}"));
+                    }
+                }
+            }
+
+            debug.set_error(last_error.unwrap_or_else(|| {
+                format!(
+                    "failed to start debug server in {DEBUG_HTTP_DEFAULT_HOST}:{}-{}",
+                    DEBUG_HTTP_DEFAULT_PORT_START, DEBUG_HTTP_DEFAULT_PORT_END
+                )
+            }));
         });
-    start_debug_http_server_at_addr(debug, writer, addr);
+}
+
+fn next_default_debug_http_addr() -> String {
+    let port = NEXT_DEBUG_HTTP_PORT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(
+                if current >= DEBUG_HTTP_DEFAULT_PORT_END || current < DEBUG_HTTP_DEFAULT_PORT_START
+                {
+                    DEBUG_HTTP_DEFAULT_PORT_START
+                } else {
+                    current + 1
+                },
+            )
+        })
+        .unwrap_or(DEBUG_HTTP_DEFAULT_PORT_START);
+    let port = if (DEBUG_HTTP_DEFAULT_PORT_START..=DEBUG_HTTP_DEFAULT_PORT_END).contains(&port) {
+        port
+    } else {
+        DEBUG_HTTP_DEFAULT_PORT_START
+    };
+
+    format!("{DEBUG_HTTP_DEFAULT_HOST}:{port}")
 }
 
 pub(crate) fn start_debug_http_server_at_addr(
@@ -216,24 +270,32 @@ pub(crate) fn start_debug_http_server_at_addr(
                 }
             };
 
-            debug.set_listening_addr(addr.clone());
-            if should_log_debug_http_start() {
-                eprintln!("debug http listening on http://{addr}");
-            }
-
-            for mut request in server.incoming_requests() {
-                debug.record_http_request();
-                let method = request.method().as_str().to_string();
-                let path = request.url().split('?').next().unwrap_or("/").to_string();
-
-                let response =
-                    handle_debug_request(&mut request, &method, &path, &debug, writer.as_ref());
-
-                if let Err(err) = request.respond(response) {
-                    debug.set_error(format!("failed to send HTTP response: {err}"));
-                }
-            }
+            serve_debug_http(server, debug, writer, addr);
         });
+}
+
+fn serve_debug_http(
+    server: Server,
+    debug: SharedDebugState,
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    addr: String,
+) {
+    debug.set_listening_addr(addr.clone());
+    if should_log_debug_http_start() {
+        eprintln!("debug http listening on http://{addr}");
+    }
+
+    for mut request in server.incoming_requests() {
+        debug.record_http_request();
+        let method = request.method().as_str().to_string();
+        let path = request.url().split('?').next().unwrap_or("/").to_string();
+
+        let response = handle_debug_request(&mut request, &method, &path, &debug, writer.as_ref());
+
+        if let Err(err) = request.respond(response) {
+            debug.set_error(format!("failed to send HTTP response: {err}"));
+        }
+    }
 }
 
 fn should_log_debug_http_start() -> bool {

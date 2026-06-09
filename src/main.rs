@@ -48,7 +48,8 @@ actions!(
         SwitchToTab7,
         SwitchToTab8,
         SwitchToTab9,
-        SwitchToTab10
+        SwitchToTab10,
+        RenameActiveTab
     ]
 );
 
@@ -84,6 +85,7 @@ fn main() {
             KeyBinding::new("cmd-8", SwitchToTab8, None),
             KeyBinding::new("cmd-9", SwitchToTab9, None),
             KeyBinding::new("cmd-0", SwitchToTab10, None),
+            KeyBinding::new("cmd-shift-i", RenameActiveTab, None),
         ]);
         cx.set_menus(vec![Menu {
             name: "Agent Terminal".into(),

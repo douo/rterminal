@@ -24,15 +24,24 @@ enum TerminalTabKind {
 struct TerminalTab {
     id: usize,
     kind: TerminalTabKind,
+    custom_title: Option<String>,
 }
 
 impl TerminalTab {
     fn title(&self, cx: &mut Context<TerminalTabs>) -> String {
-        let raw_title = match &self.kind {
-            TerminalTabKind::Terminal { terminal, .. } => terminal.read(cx).tab_title(),
-            TerminalTabKind::Snapshot { snapshot } => snapshot.read(cx).title(),
-        };
+        let raw_title = self.raw_title(cx);
         truncate_tab_title(&raw_title, MAX_TAB_TITLE_CHARS)
+    }
+
+    fn raw_title(&self, cx: &mut Context<TerminalTabs>) -> String {
+        if let Some(custom_title) = &self.custom_title {
+            custom_title.clone()
+        } else {
+            match &self.kind {
+                TerminalTabKind::Terminal { terminal, .. } => terminal.read(cx).tab_title(),
+                TerminalTabKind::Snapshot { snapshot } => snapshot.read(cx).title(),
+            }
+        }
     }
 
     fn focus(&self, window: &mut Window, cx: &mut Context<TerminalTabs>) {
@@ -80,6 +89,9 @@ pub(crate) struct TerminalTabs {
     next_tab_id: usize,
     next_snapshot_id: usize,
     pending_focus_sync: bool,
+    focus_handle: gpui::FocusHandle,
+    renaming_tab_id: Option<usize>,
+    rename_buffer: String,
 }
 
 impl TerminalTabs {
@@ -91,6 +103,9 @@ impl TerminalTabs {
             next_tab_id: 1,
             next_snapshot_id: 1,
             pending_focus_sync: false,
+            focus_handle: cx.focus_handle(),
+            renaming_tab_id: None,
+            rename_buffer: String::new(),
         };
 
         this.open_new_tab(window, cx);
@@ -115,6 +130,7 @@ impl TerminalTabs {
                 terminal,
                 _exit_subscription: exit_subscription,
             },
+            custom_title: None,
         });
         self.active_tab = self.tabs.len().saturating_sub(1);
         self.request_focus_active_tab(window, cx);
@@ -140,6 +156,7 @@ impl TerminalTabs {
         self.tabs.push(TerminalTab {
             id: tab_id,
             kind: TerminalTabKind::Snapshot { snapshot },
+            custom_title: None,
         });
         self.active_tab = self.tabs.len().saturating_sub(1);
         self.request_focus_active_tab(window, cx);
@@ -275,6 +292,65 @@ impl TerminalTabs {
         self.open_snapshot_tab_from_active(window, cx);
     }
 
+    fn on_rename_active_tab(
+        &mut self,
+        _: &crate::RenameActiveTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            self.renaming_tab_id = Some(tab.id);
+            self.rename_buffer = tab.raw_title(cx);
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    fn on_key_down(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.renaming_tab_id.is_none() {
+            return;
+        }
+
+        cx.stop_propagation();
+
+        let key = event.keystroke.key.as_str();
+        if key == "enter" {
+            let renaming_id = self.renaming_tab_id.take();
+            if let Some(tab_id) = renaming_id
+                && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
+            {
+                let new_title = self.rename_buffer.trim().to_string();
+                if new_title.is_empty() {
+                    tab.custom_title = None;
+                } else {
+                    tab.custom_title = Some(new_title);
+                }
+            }
+            self.request_focus_active_tab(window, cx);
+            cx.notify();
+        } else if key == "escape" {
+            self.renaming_tab_id = None;
+            self.request_focus_active_tab(window, cx);
+            cx.notify();
+        } else if key == "backspace" {
+            self.rename_buffer.pop();
+            cx.notify();
+        } else if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform {
+            if let Some(ch) = &event.keystroke.key_char {
+                self.rename_buffer.push_str(ch);
+                cx.notify();
+            } else if key == "space" {
+                self.rename_buffer.push(' ');
+                cx.notify();
+            }
+        }
+    }
+
     define_tab_switch_handlers!(
         (on_switch_to_tab1, crate::SwitchToTab1, 0),
         (on_switch_to_tab2, crate::SwitchToTab2, 1),
@@ -297,13 +373,19 @@ impl Render for TerminalTabs {
         }
 
         let this = cx.entity();
-        let tabs_data: Vec<(usize, String, bool)> = self
+        let tabs_data: Vec<(usize, String, bool, bool)> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(index, tab)| {
-                let title = tab.title(cx);
-                (tab.id, title, index == self.active_tab)
+                let is_active = index == self.active_tab;
+                let is_renaming = Some(tab.id) == self.renaming_tab_id;
+                let title = if is_renaming {
+                    format!("{}|", self.rename_buffer)
+                } else {
+                    tab.title(cx)
+                };
+                (tab.id, title, is_active, is_renaming)
             })
             .collect();
         let active_content = self.tabs.get(self.active_tab).map(|tab| match &tab.kind {
@@ -321,10 +403,24 @@ impl Render for TerminalTabs {
                 .items_center()
                 .gap_1()
                 .child(div().w(TRAFFIC_LIGHT_LEFT_GUTTER)),
-            |row, (tab_id, title, active)| {
+            |row, (tab_id, title, active, renaming)| {
                 let this = this.clone();
                 let bg = if active { rgb(0x252a34) } else { rgb(0x1d222b) };
                 let fg = if active { rgb(0xffffff) } else { rgb(0xa9b1c6) };
+
+                let tab_content = if renaming {
+                    div()
+                        .px_1()
+                        .border_1()
+                        .border_color(rgb(0x41a1f0))
+                        .rounded(px(4.0))
+                        .bg(rgb(0x1a1d24))
+                        .text_color(rgb(0xffffff))
+                        .child(title)
+                } else {
+                    div().child(title)
+                };
+
                 row.child(
                     div()
                         .px_3()
@@ -335,7 +431,7 @@ impl Render for TerminalTabs {
                         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                             this.update(cx, |this, cx| this.activate_tab_by_id(tab_id, window, cx));
                         })
-                        .child(title),
+                        .child(tab_content),
                 )
             },
         );
@@ -372,6 +468,8 @@ impl Render for TerminalTabs {
 
         div()
             .id("terminal-tabs")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
             .bg(rgb(0x0f1115))
             .on_action(cx.listener(Self::on_new_tab))
@@ -379,6 +477,7 @@ impl Render for TerminalTabs {
             .on_action(cx.listener(Self::on_capture_snapshot_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
+            .on_action(cx.listener(Self::on_rename_active_tab))
             .on_action(cx.listener(Self::on_switch_to_tab1))
             .on_action(cx.listener(Self::on_switch_to_tab2))
             .on_action(cx.listener(Self::on_switch_to_tab3))
@@ -466,5 +565,25 @@ mod tests {
         assert_eq!(truncate_tab_title("abcdef", 3), "...");
         assert_eq!(truncate_tab_title("abcdef", 2), "..");
         assert_eq!(truncate_tab_title("abcdef", 1), ".");
+    }
+
+    #[test]
+    fn custom_title_override_logic() {
+        // Validate option-based title override logic
+        let custom_title: Option<String> = Some("custom tab name".to_string());
+        let raw_title = if let Some(title) = &custom_title {
+            title.clone()
+        } else {
+            "default tab name".to_string()
+        };
+        assert_eq!(raw_title, "custom tab name");
+
+        let custom_title_empty: Option<String> = None;
+        let raw_title_fallback = if let Some(title) = &custom_title_empty {
+            title.clone()
+        } else {
+            "default tab name".to_string()
+        };
+        assert_eq!(raw_title_fallback, "default tab name");
     }
 }

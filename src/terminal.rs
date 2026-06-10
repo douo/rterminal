@@ -245,6 +245,7 @@ pub(crate) struct AgentTerminal {
     pub(crate) input_trace: bool,
     pub(crate) input_logger: Option<InputLogger>,
     pub(crate) last_local_key_event_at: Option<Instant>,
+    pub(crate) last_focus_in_at: Option<Instant>,
     pub(crate) pty_sample_started_at: Instant,
     pub(crate) pty_sample_bytes: usize,
     pub(crate) pty_sample_chunks: usize,
@@ -412,6 +413,7 @@ impl AgentTerminal {
             input_trace: is_input_trace_enabled(),
             input_logger,
             last_local_key_event_at: None,
+            last_focus_in_at: None,
             pty_sample_started_at: Instant::now(),
             pty_sample_bytes: 0,
             pty_sample_chunks: 0,
@@ -443,6 +445,7 @@ impl AgentTerminal {
         }));
         this._focus_in_sub = Some(
             cx.on_focus(&this.focus_handle, window, |this, _window, _cx| {
+                this.last_focus_in_at = Some(Instant::now());
                 if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                     this.write_bytes(b"\x1b[I");
                 }

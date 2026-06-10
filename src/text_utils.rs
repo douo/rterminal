@@ -42,6 +42,10 @@ pub(crate) fn should_accept_ax_override(
         return false;
     }
 
+    if ax_text.is_empty() && !model_text.is_empty() {
+        return false;
+    }
+
     let differs_from_model = ax_text != model_text || ax_cursor_utf16 != model_cursor_utf16;
     let is_stale_last_publish =
         ax_text == last_published_text && ax_cursor_utf16 == last_published_cursor_utf16;
@@ -176,5 +180,10 @@ mod tests {
     #[test]
     fn accepts_ax_override_after_local_baseline_exists() {
         assert!(should_accept_ax_override("abcd", 4, "abc", 3, "abc", 3,));
+    }
+
+    #[test]
+    fn rejects_empty_ax_override_for_nonempty_model() {
+        assert!(!should_accept_ax_override("", 0, "typed", 5, "typed", 5,));
     }
 }

@@ -1003,37 +1003,28 @@ impl AgentTerminal {
             return false;
         }
         let screen_match = self.ax_text_matches_screen_context(&state.text);
-        if !screen_match && self.ax_text_has_probable_prefix_noise(&state.text) {
+        if !screen_match {
+            let reason = if self.ax_text_has_probable_prefix_noise(&state.text) {
+                "probable_prefix_noise"
+            } else {
+                "screen_mismatch"
+            };
             self.trace_input(format!(
-                "ax override rejected (probable prefix noise) model={} ax={}",
+                "ax override rejected ({}) model={} ax={}",
+                reason,
                 summarize_text_for_trace(&self.input_line),
                 summarize_text_for_trace(&state.text)
             ));
             self.log_input_event(
                 "ax_override_rejected",
                 json!({
-                    "reason": "probable_prefix_noise",
+                    "reason": reason,
                     "model_line": self.input_log_text_value(&self.input_line),
                     "ax_line": self.input_log_text_value(&state.text),
                     "ax_cursor_utf16": cursor_utf16,
                 }),
             );
             return false;
-        }
-        if !screen_match {
-            self.trace_input(format!(
-                "ax override accepted despite screen mismatch model={} ax={}",
-                summarize_text_for_trace(&self.input_line),
-                summarize_text_for_trace(&state.text)
-            ));
-            self.log_input_event(
-                "ax_override_mismatch_accepted",
-                json!({
-                    "model_line": self.input_log_text_value(&self.input_line),
-                    "ax_line": self.input_log_text_value(&state.text),
-                    "ax_cursor_utf16": cursor_utf16,
-                }),
-            );
         }
 
         self.trace_input(format!(
@@ -1117,6 +1108,11 @@ impl AgentTerminal {
         if self.ime_marked_text.is_some() {
             return false;
         }
+        if let Some(last_focus_in) = self.last_focus_in_at
+            && last_focus_in.elapsed() < AX_OVERRIDE_GUARD_WINDOW
+        {
+            return false;
+        }
         match self.last_local_key_event_at {
             Some(last_event) => last_event.elapsed() >= AX_OVERRIDE_GUARD_WINDOW,
             None => true,
@@ -1159,9 +1155,12 @@ impl AgentTerminal {
 
         let row_before_cursor = row_before_cursor.trim_end();
         let visible_row = visible_row.trim_end();
-        visible_row.contains(ax_text)
-            || row_before_cursor.contains(ax_text)
-            || ax_text.starts_with(&self.input_line)
+        ax_text_matches_visible_input_context(
+            ax_text,
+            &self.input_line,
+            visible_row,
+            row_before_cursor,
+        )
     }
 
     fn ax_text_has_probable_prefix_noise(&self, ax_text: &str) -> bool {
@@ -1510,6 +1509,26 @@ fn probable_ascii_prefix_noise(ax_text: &str, model_text: &str) -> bool {
     (1..=4).contains(&prefix_len) && prefix.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
 
+fn ax_text_matches_visible_input_context(
+    ax_text: &str,
+    model_text: &str,
+    visible_row: &str,
+    row_before_cursor: &str,
+) -> bool {
+    if ax_text.is_empty() {
+        return true;
+    }
+
+    if !model_text.is_empty()
+        && ax_text != model_text
+        && (row_before_cursor.ends_with(model_text) || visible_row.ends_with(model_text))
+    {
+        return false;
+    }
+
+    row_before_cursor.ends_with(ax_text) || visible_row.ends_with(ax_text)
+}
+
 fn is_high_priority_control_bytes(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
@@ -1676,9 +1695,9 @@ mod tests {
     use crate::terminal::CellSnapshot;
 
     use super::{
-        dropped_paths_text, evaluate_paste_risk, extract_selection_text,
-        normalize_selection_bounds, probable_ascii_prefix_noise, selection_contains_cell,
-        shell_escape_path,
+        ax_text_matches_visible_input_context, dropped_paths_text, evaluate_paste_risk,
+        extract_selection_text, normalize_selection_bounds, probable_ascii_prefix_noise,
+        selection_contains_cell, shell_escape_path,
     };
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
 
@@ -1803,6 +1822,26 @@ mod tests {
         assert!(!probable_ascii_prefix_noise("前缀你好世界", "你好世界"));
         assert!(!probable_ascii_prefix_noise("12345你好世界", "你好世界"));
         assert!(!probable_ascii_prefix_noise("你好世界abc", "你好世界"));
+    }
+
+    #[test]
+    fn ax_context_rejects_other_tab_text_that_extends_current_model() {
+        assert!(!ax_text_matches_visible_input_context(
+            "abcd",
+            "abc",
+            "prompt abc",
+            "prompt abc",
+        ));
+    }
+
+    #[test]
+    fn ax_context_accepts_shell_rewritten_visible_input() {
+        assert!(ax_text_matches_visible_input_context(
+            "git status",
+            "abc",
+            "prompt git status",
+            "prompt git status",
+        ));
     }
 
     #[test]

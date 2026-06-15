@@ -38,6 +38,24 @@ pub enum Event {
     /// Write some text to the PTY.
     PtyWrite(String),
 
+    /// The visible terminal grid scrolled inside a region.
+    ///
+    /// `region_bottom` is exclusive. Negative `delta` means text moved up; positive `delta` means
+    /// text moved down.
+    Scroll {
+        region_top: usize,
+        region_bottom: usize,
+        delta: i32,
+    },
+
+    /// A visible terminal region was erased.
+    ///
+    /// `region_bottom` is exclusive.
+    Erase {
+        region_top: usize,
+        region_bottom: usize,
+    },
+
     /// Request to write the text area size.
     TextAreaSizeRequest(Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>),
 
@@ -68,6 +86,12 @@ impl Debug for Event {
             Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
+            Event::Scroll { region_top, region_bottom, delta } => {
+                write!(f, "Scroll({region_top}..{region_bottom}, {delta})")
+            },
+            Event::Erase { region_top, region_bottom } => {
+                write!(f, "Erase({region_top}..{region_bottom})")
+            },
             Event::Title(title) => write!(f, "Title({title})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),

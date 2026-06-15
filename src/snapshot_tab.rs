@@ -1,7 +1,7 @@
 use gpui::{
-    ClipboardItem, Context, FocusHandle, FontFallbacks, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, Window, canvas,
-    div, fill, font, point, prelude::*, px, rgb, rgba, size,
+    ClipboardItem, Context, FocusHandle, FontFallbacks, FontStyle, FontWeight, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta,
+    ScrollWheelEvent, Window, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
 };
 
 use crate::cli::Theme;
@@ -400,9 +400,30 @@ impl Render for SnapshotTab {
 
                                 if !is_spacer_col && !cell.is_blank() {
                                     let cell_text = cell.text();
+                                    let underline =
+                                        cell.underline.then_some(gpui::UnderlineStyle {
+                                            color: Some(cell.fg),
+                                            thickness: px(1.0),
+                                            wavy: cell.undercurl,
+                                        });
+                                    let mut font = mono.clone();
+                                    if cell.bold {
+                                        font.weight = FontWeight::BOLD;
+                                    }
+                                    if cell.italic {
+                                        font.style = FontStyle::Italic;
+                                    }
+                                    let strikethrough =
+                                        cell.strikethrough.then_some(gpui::StrikethroughStyle {
+                                            color: Some(cell.fg),
+                                            thickness: px(1.0),
+                                        });
                                     let run = gpui::TextRun {
                                         len: cell_text.len(),
+                                        font,
                                         color: cell.fg,
+                                        underline,
+                                        strikethrough,
                                         ..run_template.clone()
                                     };
                                     let shaped = window.text_system().shape_line(

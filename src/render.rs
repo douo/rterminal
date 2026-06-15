@@ -1,8 +1,8 @@
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-    Bounds, Context, ExternalPaths, Font, FontFallbacks, Hitbox, HitboxBehavior, Hsla, MouseButton,
-    Pixels, Render, Window, WindowControlArea, canvas, div, fill, font, point, prelude::*, px, rgb,
-    rgba, size,
+    Bounds, ContentMask, Context, Corners, ExternalPaths, Font, FontFallbacks, FontStyle,
+    FontWeight, Hitbox, HitboxBehavior, Hsla, MouseButton, Pixels, Render, Window,
+    WindowControlArea, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
 };
 
 use crate::cli::Theme;
@@ -204,6 +204,7 @@ impl Render for AgentTerminal {
         }
 
         let snapshot = self.snapshot.clone();
+        let images = self.images.clone();
         let ime_marked_text = self.ime_marked_text.clone();
         let cursor_shape = self.cursor_shape;
         let (cursor_visual_row, cursor_visual_col, cursor_sliding) = self.cursor_visual_state();
@@ -347,20 +348,41 @@ impl Render for AgentTerminal {
 
                                 if !is_spacer_col && !cell.is_blank() {
                                     let cell_text = cell.text();
-                                    let underline =
-                                        cell.link.as_ref().map(|_| gpui::UnderlineStyle {
-                                            color: Some(link_color),
+                                    let underline = if cell.link.is_some() || cell.underline {
+                                        Some(gpui::UnderlineStyle {
+                                            color: Some(if cell.link.is_some() {
+                                                link_color
+                                            } else {
+                                                cell.fg
+                                            }),
                                             thickness: px(1.0),
-                                            wavy: false,
+                                            wavy: cell.undercurl,
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    let mut font = mono.clone();
+                                    if cell.bold {
+                                        font.weight = FontWeight::BOLD;
+                                    }
+                                    if cell.italic {
+                                        font.style = FontStyle::Italic;
+                                    }
+                                    let strikethrough =
+                                        cell.strikethrough.then_some(gpui::StrikethroughStyle {
+                                            color: Some(cell.fg),
+                                            thickness: px(1.0),
                                         });
                                     let run = gpui::TextRun {
                                         len: cell_text.len(),
+                                        font,
                                         color: if cell.link.is_some() {
                                             link_color
                                         } else {
                                             cell.fg
                                         },
                                         underline,
+                                        strikethrough,
                                         ..run_template.clone()
                                     };
                                     let shaped = window.text_system().shape_line(
@@ -388,6 +410,40 @@ impl Render for AgentTerminal {
                                 }
                             }
                         }
+
+                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                            for image in &images {
+                                if image.row >= snapshot.cells.len() as isize
+                                    || image.row + image.rows as isize <= 0
+                                {
+                                    continue;
+                                }
+
+                                let image_extra_cols = snapshot
+                                    .cells
+                                    .get(image.row.max(0) as usize)
+                                    .map(|row| visual_extra_cols_before(row, image.col))
+                                    .unwrap_or(0.0);
+                                let image_origin = point(
+                                    origin.x + (image.col as f32 + image_extra_cols) * cell_width,
+                                    origin.y + image.row as f32 * line_height,
+                                );
+                                let image_bounds = Bounds::new(
+                                    image_origin,
+                                    size(
+                                        cell_width * image.cols.max(1) as f32,
+                                        line_height * image.rows.max(1) as f32,
+                                    ),
+                                );
+                                let _ = window.paint_image(
+                                    image_bounds,
+                                    Corners::default(),
+                                    image.image.clone(),
+                                    0,
+                                    false,
+                                );
+                            }
+                        });
 
                         if focused
                             && let Some(text_to_mark) = ime_marked_text.as_ref()

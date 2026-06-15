@@ -7,6 +7,7 @@ use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as AlacTermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::sixel::{SixelImage, decode_sixel_payload, decode_tmux_passthrough_sixel};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{ClipboardType, Config, TermMode};
 use alacritty_terminal::vte::ansi::{
@@ -14,8 +15,8 @@ use alacritty_terminal::vte::ansi::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, FontFallbacks, Pixels, Subscription,
-    Task, Window, px,
+    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, FontFallbacks, Pixels, RenderImage,
+    Subscription, Task, Window, px,
 };
 use parking_lot::Mutex;
 use portable_pty::{Child, MasterPty, PtySize};
@@ -102,6 +103,15 @@ enum PendingTerminalEvent {
         ClipboardType,
         Arc<dyn Fn(&str) -> String + Sync + Send + 'static>,
     ),
+    Scroll {
+        region_top: usize,
+        region_bottom: usize,
+        delta: i32,
+    },
+    Erase {
+        region_top: usize,
+        region_bottom: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -135,9 +145,40 @@ impl EventListener for TitleTrackingListener {
                     .lock()
                     .push(PendingTerminalEvent::ClipboardLoad(clipboard, format));
             }
+            AlacTermEvent::Scroll {
+                region_top,
+                region_bottom,
+                delta,
+            } => {
+                self.pending_events
+                    .lock()
+                    .push(PendingTerminalEvent::Scroll {
+                        region_top,
+                        region_bottom,
+                        delta,
+                    });
+            }
+            AlacTermEvent::Erase {
+                region_top,
+                region_bottom,
+            } => {
+                self.pending_events.lock().push(PendingTerminalEvent::Erase {
+                    region_top,
+                    region_bottom,
+                });
+            }
             _ => {}
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct TerminalImage {
+    pub(crate) row: isize,
+    pub(crate) col: usize,
+    pub(crate) cols: usize,
+    pub(crate) rows: usize,
+    pub(crate) image: Arc<RenderImage>,
 }
 
 #[derive(Clone)]
@@ -147,6 +188,11 @@ pub(crate) struct CellSnapshot {
     pub(crate) fg: gpui::Hsla,
     pub(crate) bg: Option<gpui::Hsla>,
     pub(crate) link: Option<String>,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) undercurl: bool,
+    pub(crate) strikethrough: bool,
     pub(crate) width_cols: u8,
     pub(crate) spans_next_col: bool,
     pub(crate) expands_layout: bool,
@@ -160,11 +206,26 @@ impl Default for CellSnapshot {
             fg: gpui::Hsla::default(),
             bg: None,
             link: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strikethrough: false,
             width_cols: 1,
             spans_next_col: false,
             expands_layout: false,
         }
     }
+}
+
+fn cell_style_flags(flags: Flags) -> (bool, bool, bool, bool, bool) {
+    (
+        flags.contains(Flags::BOLD),
+        flags.contains(Flags::ITALIC),
+        flags.intersects(Flags::ALL_UNDERLINES),
+        flags.contains(Flags::UNDERCURL),
+        flags.contains(Flags::STRIKEOUT),
+    )
 }
 
 impl CellSnapshot {
@@ -213,8 +274,10 @@ pub(crate) struct AgentTerminal {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) term: Term<TitleTrackingListener>,
     pub(crate) processor: Processor<StdSyncHandler>,
+    sixel_parser: SixelStreamParser,
     pub(crate) grid_size: GridSize,
     pub(crate) snapshot: ScreenSnapshot,
+    pub(crate) images: Vec<TerminalImage>,
     pub(crate) cursor_shape: CursorShape,
     pub(crate) force_vertical_cursor: bool,
     pub(crate) cursor_slide_enabled: bool,
@@ -234,6 +297,8 @@ pub(crate) struct AgentTerminal {
     pub(crate) font_fallbacks: Option<FontFallbacks>,
     pub(crate) forced_double_width_chars: HashSet<char>,
     pub(crate) font_size: Pixels,
+    pub(crate) cell_width: Pixels,
+    pty_pixel_size: PtyPixelSize,
     pub(crate) master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
     pub(crate) writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     pub(crate) child: Option<Arc<Mutex<Box<dyn Child + Send>>>>,
@@ -310,32 +375,37 @@ impl AgentTerminal {
             line_height_for(font_size),
             cli.show_status_bar,
         );
+        let pty_pixel_size =
+            pty_pixel_size_for_grid(grid_size, cell_width, line_height_for(font_size));
 
         let terminal_title = Arc::new(Mutex::new(None));
         let pending_term_events = Arc::new(Mutex::new(Vec::new()));
-        let (shell, master, writer, child, output_rx, debug) =
-            match PtySession::spawn(grid_size.rows, grid_size.cols) {
-                Ok(session) => {
-                    let shell = session.shell.clone();
-                    let debug =
-                        SharedDebugState::new(shell.clone(), "connected".to_string(), grid_size);
-                    (
-                        shell,
-                        Some(session.master),
-                        Some(session.writer),
-                        Some(session.child),
-                        Some(session.output_rx),
-                        debug,
-                    )
-                }
-                Err(err) => {
-                    let message = format!("failed to start shell: {err:#}");
-                    let debug =
-                        SharedDebugState::new("<none>".to_string(), message.clone(), grid_size);
-                    debug.set_error(message);
-                    (String::from("<none>"), None, None, None, None, debug)
-                }
-            };
+        let (shell, master, writer, child, output_rx, debug) = match PtySession::spawn(
+            grid_size.rows,
+            grid_size.cols,
+            pty_pixel_size.width,
+            pty_pixel_size.height,
+        ) {
+            Ok(session) => {
+                let shell = session.shell.clone();
+                let debug =
+                    SharedDebugState::new(shell.clone(), "connected".to_string(), grid_size);
+                (
+                    shell,
+                    Some(session.master),
+                    Some(session.writer),
+                    Some(session.child),
+                    Some(session.output_rx),
+                    debug,
+                )
+            }
+            Err(err) => {
+                let message = format!("failed to start shell: {err:#}");
+                let debug = SharedDebugState::new("<none>".to_string(), message.clone(), grid_size);
+                debug.set_error(message);
+                (String::from("<none>"), None, None, None, None, debug)
+            }
+        };
         let term_config = Config {
             ambiguous_wide: matches!(cli.ambiguous_width, AmbiguousWidth::Double),
             kitty_keyboard: true,
@@ -381,8 +451,10 @@ impl AgentTerminal {
             focus_handle,
             term,
             processor,
+            sixel_parser: SixelStreamParser::default(),
             grid_size,
             snapshot: ScreenSnapshot::default(),
+            images: Vec::new(),
             cursor_shape: CursorShape::Block,
             force_vertical_cursor: cli.force_vertical_cursor,
             cursor_slide_enabled: !cli.no_cursor_slide,
@@ -402,6 +474,8 @@ impl AgentTerminal {
             font_fallbacks,
             forced_double_width_chars,
             font_size,
+            cell_width,
+            pty_pixel_size,
             master,
             writer,
             child,
@@ -506,12 +580,40 @@ impl AgentTerminal {
 
         self.mark_enter_latency_first_pty();
         for chunk in chunks {
-            self.processor.advance(&mut self.term, chunk);
+            let actions = self.sixel_parser.advance(chunk);
+            for action in actions {
+                match action {
+                    SixelStreamAction::Bytes(bytes) => {
+                        self.advance_text_bytes(&bytes);
+                    }
+                    SixelStreamAction::Sixel(payload) => {
+                        let (row, col) = self.current_cursor_anchor();
+                        if let Some(image) = decode_sixel_payload(row, col, &payload) {
+                            self.store_sixel_image(image);
+                        }
+                    }
+                    SixelStreamAction::TmuxPassthrough { payload, raw } => {
+                        let (row, col) = self.current_cursor_anchor();
+                        if let Some(image) = decode_tmux_passthrough_sixel(row, col, &payload) {
+                            self.store_sixel_image(image);
+                        } else {
+                            self.advance_text_bytes(&raw);
+                        }
+                    }
+                    SixelStreamAction::UnknownDcs(raw) => {
+                        self.advance_text_bytes(&raw);
+                    }
+                }
+            }
             self.debug.record_bytes_from_pty(chunk.len());
             self.record_pty_ingest_diagnostics(chunk.len());
         }
         self.process_pending_terminal_events(cx);
         self.refresh_snapshot();
+    }
+
+    fn advance_text_bytes(&mut self, bytes: &[u8]) {
+        self.processor.advance(&mut self.term, bytes);
     }
 
     fn process_pending_terminal_events(&mut self, cx: &mut Context<Self>) {
@@ -529,8 +631,71 @@ impl AgentTerminal {
                     let text = self.load_osc52_clipboard(cx, clipboard);
                     self.write_bytes(format(&text).as_bytes());
                 }
+                PendingTerminalEvent::Scroll {
+                    region_top,
+                    region_bottom,
+                    delta,
+                } => {
+                    scroll_images_in_region(&mut self.images, region_top, region_bottom, delta);
+                }
+                PendingTerminalEvent::Erase {
+                    region_top,
+                    region_bottom,
+                } => {
+                    erase_images_in_region(&mut self.images, region_top, region_bottom);
+                }
             }
         }
+    }
+
+    fn store_sixel_image(&mut self, image: SixelImage) {
+        let row = image.row;
+        let col = image.col;
+        let width = image.width;
+        let height = image.height;
+        let line_height = self.line_height();
+        let occupied_cols = sixel_occupied_cols(width, self.cell_width);
+        let occupied_rows = sixel_occupied_rows(height, line_height);
+        let Some(render_image) = render_image_from_sixel(&image) else {
+            self.debug.set_error(format!(
+                "invalid sixel image {}x{} at {},{}",
+                width, height, row, col
+            ));
+            return;
+        };
+
+        self.images.push(TerminalImage {
+            row: row as isize,
+            col,
+            cols: occupied_cols,
+            rows: occupied_rows,
+            image: render_image,
+        });
+        if self.images.len() > 128 {
+            let remove_count = self.images.len() - 128;
+            self.images.drain(0..remove_count);
+        }
+        reserve_sixel_layout(
+            &mut self.processor,
+            &mut self.term,
+            occupied_cols,
+            occupied_rows,
+            row,
+        );
+        self.debug.set_note(Some(format!(
+            "sixel image {}x{} at {},{}",
+            width, height, row, col
+        )));
+    }
+
+    fn current_cursor_anchor(&self) -> (usize, usize) {
+        let content = self.term.renderable_content();
+        let row = (content.cursor.point.line.0 + content.display_offset as i32).max(0) as usize;
+        let col = content.cursor.point.column.0;
+        (
+            row.min(self.grid_size.rows.saturating_sub(1) as usize),
+            col.min(self.grid_size.cols.saturating_sub(1) as usize),
+        )
     }
 
     fn store_osc52_clipboard(
@@ -582,6 +747,11 @@ impl AgentTerminal {
                     ),
                     bg: None,
                     link: None,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    undercurl: false,
+                    strikethrough: false,
                     width_cols: 1,
                     spans_next_col: false,
                     expands_layout: false,
@@ -630,6 +800,8 @@ impl AgentTerminal {
             } else {
                 1
             };
+            let (bold, italic, underline, undercurl, strikethrough) =
+                cell_style_flags(indexed.cell.flags);
 
             cells[row][col] = CellSnapshot {
                 ch,
@@ -637,6 +809,11 @@ impl AgentTerminal {
                 fg: ansi_to_hsla(fg, content.colors, indexed.cell.flags, true),
                 bg: ansi_bg_to_hsla(bg, content.colors),
                 link: indexed.cell.hyperlink().map(|link| link.uri().to_string()),
+                bold,
+                italic,
+                underline,
+                undercurl,
+                strikethrough,
                 width_cols,
                 spans_next_col,
                 expands_layout,
@@ -686,7 +863,9 @@ impl AgentTerminal {
             self.line_height(),
             self.show_status_bar,
         );
-        self.apply_grid_size(new_grid);
+        self.cell_width = cell_width;
+        let pty_pixel_size = pty_pixel_size_for_grid(new_grid, cell_width, self.line_height());
+        self.apply_grid_size(new_grid, pty_pixel_size);
     }
 
     pub(crate) fn line_height(&self) -> Pixels {
@@ -705,20 +884,24 @@ impl AgentTerminal {
         self.sync_grid_to_window(window);
     }
 
-    pub(crate) fn apply_grid_size(&mut self, new_grid: GridSize) {
-        if new_grid == self.grid_size {
+    pub(crate) fn apply_grid_size(&mut self, new_grid: GridSize, pty_pixel_size: PtyPixelSize) {
+        if new_grid == self.grid_size && pty_pixel_size == self.pty_pixel_size {
             return;
         }
 
+        let grid_changed = new_grid != self.grid_size;
         self.grid_size = new_grid;
-        self.term.resize(new_grid);
+        self.pty_pixel_size = pty_pixel_size;
+        if grid_changed {
+            self.term.resize(new_grid);
+        }
 
         if let Some(master) = &self.master
             && let Err(err) = master.lock().resize(PtySize {
                 rows: new_grid.rows,
                 cols: new_grid.cols,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: pty_pixel_size.width,
+                pixel_height: pty_pixel_size.height,
             })
         {
             self.debug.set_error(format!("pty resize failed: {err:#}"));
@@ -776,6 +959,11 @@ impl AgentTerminal {
                     fg: default_fg,
                     bg: None,
                     link: None,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    undercurl: false,
+                    strikethrough: false,
                     width_cols: 1,
                     spans_next_col: false,
                     expands_layout: false,
@@ -813,6 +1001,8 @@ impl AgentTerminal {
                 } else {
                     1
                 };
+                let (bold, italic, underline, undercurl, strikethrough) =
+                    cell_style_flags(cell.flags);
 
                 row[col] = CellSnapshot {
                     ch,
@@ -820,6 +1010,11 @@ impl AgentTerminal {
                     fg: ansi_to_hsla(fg, colors, cell.flags, true),
                     bg: ansi_bg_to_hsla(bg, colors),
                     link: cell.hyperlink().map(|link| link.uri().to_string()),
+                    bold,
+                    italic,
+                    underline,
+                    undercurl,
+                    strikethrough,
                     width_cols,
                     spans_next_col,
                     expands_layout,
@@ -1261,6 +1456,283 @@ fn is_input_trace_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn render_image_from_sixel(sixel: &SixelImage) -> Option<Arc<RenderImage>> {
+    if sixel.width == 0 || sixel.height == 0 || sixel.rgba.len() != sixel.width * sixel.height * 4 {
+        return None;
+    }
+
+    let mut bgra = sixel.rgba.clone();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    let pixels = image::RgbaImage::from_raw(sixel.width as u32, sixel.height as u32, bgra)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
+}
+
+fn reserve_sixel_layout<T: EventListener>(
+    processor: &mut Processor<StdSyncHandler>,
+    term: &mut Term<T>,
+    occupied_cols: usize,
+    occupied_rows: usize,
+    anchor_row: usize,
+) -> usize {
+    let mut reservation = Vec::with_capacity(32);
+    if occupied_cols > 0 {
+        reservation.extend_from_slice(format!("\x1b[{}C", occupied_cols).as_bytes());
+    }
+    if occupied_rows > 1 {
+        reservation.extend_from_slice(format!("\x1b[{}B", occupied_rows - 1).as_bytes());
+    }
+    reservation.push(b'\r');
+    reservation.push(b'\n');
+    processor.advance(term, &reservation);
+
+    let content = term.renderable_content();
+    let cursor_row = (content.cursor.point.line.0 + content.display_offset as i32).max(0) as usize;
+    anchor_row
+        .saturating_add(occupied_rows)
+        .saturating_sub(cursor_row)
+}
+
+fn sixel_occupied_cols(image_width: usize, cell_width: Pixels) -> usize {
+    let cell_width = f32::from(cell_width.max(px(1.0)));
+    ((image_width as f32) / cell_width).ceil().max(1.0) as usize
+}
+
+fn sixel_occupied_rows(image_height: usize, line_height: Pixels) -> usize {
+    let line_height = f32::from(line_height.max(px(1.0)));
+    ((image_height as f32) / line_height).ceil().max(1.0) as usize
+}
+
+fn scroll_images_in_region(
+    images: &mut Vec<TerminalImage>,
+    region_top: usize,
+    region_bottom: usize,
+    delta: i32,
+) {
+    if delta == 0 || region_top >= region_bottom {
+        return;
+    }
+
+    let region_top = region_top as isize;
+    let region_bottom = region_bottom as isize;
+    let delta = delta as isize;
+    *images = images
+        .drain(..)
+        .filter_map(|mut image| {
+            let image_bottom = image.row + image.rows as isize;
+            let intersects_region = image.row < region_bottom && image_bottom > region_top;
+            if !intersects_region {
+                return Some(image);
+            }
+
+            image.row += delta;
+            let image_bottom = image.row + image.rows as isize;
+            if image.row >= region_bottom || image_bottom <= region_top {
+                return None;
+            }
+
+            Some(image)
+        })
+        .collect();
+}
+
+fn erase_images_in_region(images: &mut Vec<TerminalImage>, region_top: usize, region_bottom: usize) {
+    if region_top >= region_bottom {
+        return;
+    }
+
+    let region_top = region_top as isize;
+    let region_bottom = region_bottom as isize;
+    images.retain(|image| {
+        let image_bottom = image.row + image.rows as isize;
+        !(image.row < region_bottom && image_bottom > region_top)
+    });
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PtyPixelSize {
+    width: u16,
+    height: u16,
+}
+
+pub(crate) fn pty_pixel_size_for_grid(
+    grid_size: GridSize,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> PtyPixelSize {
+    PtyPixelSize {
+        width: pixels_to_pty_size(cell_width * grid_size.cols as f32),
+        height: pixels_to_pty_size(line_height * grid_size.rows as f32),
+    }
+}
+
+fn pixels_to_pty_size(value: Pixels) -> u16 {
+    f32::from(value).round().clamp(1.0, u16::MAX as f32) as u16
+}
+
+#[derive(Default)]
+struct SixelStreamParser {
+    state: SixelStreamState,
+}
+
+enum SixelStreamAction {
+    Bytes(Vec<u8>),
+    Sixel(Vec<u8>),
+    TmuxPassthrough { payload: Vec<u8>, raw: Vec<u8> },
+    UnknownDcs(Vec<u8>),
+}
+
+#[derive(Default)]
+enum SixelStreamState {
+    #[default]
+    Ground,
+    Escape,
+    DcsEntry {
+        raw: Vec<u8>,
+    },
+    DcsData {
+        action: u8,
+        raw: Vec<u8>,
+        payload: Vec<u8>,
+        pending_escape: bool,
+    },
+}
+
+impl SixelStreamParser {
+    fn advance(&mut self, bytes: &[u8]) -> Vec<SixelStreamAction> {
+        let mut actions = Vec::new();
+        let mut output = Vec::new();
+
+        for byte in bytes.iter().copied() {
+            self.advance_byte(byte, &mut output, &mut actions);
+        }
+
+        if !output.is_empty() {
+            actions.push(SixelStreamAction::Bytes(output));
+        }
+        actions
+    }
+
+    fn advance_byte(
+        &mut self,
+        byte: u8,
+        output: &mut Vec<u8>,
+        actions: &mut Vec<SixelStreamAction>,
+    ) {
+        let state = std::mem::take(&mut self.state);
+        self.state = match state {
+            SixelStreamState::Ground => {
+                if byte == 0x1b {
+                    SixelStreamState::Escape
+                } else {
+                    output.push(byte);
+                    SixelStreamState::Ground
+                }
+            }
+            SixelStreamState::Escape => match byte {
+                b'P' => SixelStreamState::DcsEntry {
+                    raw: vec![0x1b, b'P'],
+                },
+                0x1b => {
+                    output.push(0x1b);
+                    SixelStreamState::Escape
+                }
+                _ => {
+                    output.push(0x1b);
+                    output.push(byte);
+                    SixelStreamState::Ground
+                }
+            },
+            SixelStreamState::DcsEntry { mut raw } => {
+                raw.push(byte);
+                if (0x40..=0x7e).contains(&byte) {
+                    SixelStreamState::DcsData {
+                        action: byte,
+                        raw,
+                        payload: Vec::new(),
+                        pending_escape: false,
+                    }
+                } else {
+                    SixelStreamState::DcsEntry { raw }
+                }
+            }
+            SixelStreamState::DcsData {
+                action,
+                mut raw,
+                mut payload,
+                mut pending_escape,
+            } => {
+                raw.push(byte);
+                if byte == 0x9c {
+                    self.finish_dcs(action, raw, payload, output, actions);
+                    SixelStreamState::Ground
+                } else if pending_escape {
+                    if action == b't' && byte == 0x1b {
+                        payload.push(0x1b);
+                        payload.push(byte);
+                        SixelStreamState::DcsData {
+                            action,
+                            raw,
+                            payload,
+                            pending_escape: false,
+                        }
+                    } else if byte == b'\\' {
+                        self.finish_dcs(action, raw, payload, output, actions);
+                        SixelStreamState::Ground
+                    } else {
+                        payload.push(0x1b);
+                        payload.push(byte);
+                        pending_escape = byte == 0x1b;
+                        SixelStreamState::DcsData {
+                            action,
+                            raw,
+                            payload,
+                            pending_escape,
+                        }
+                    }
+                } else if byte == 0x1b {
+                    pending_escape = true;
+                    SixelStreamState::DcsData {
+                        action,
+                        raw,
+                        payload,
+                        pending_escape,
+                    }
+                } else {
+                    payload.push(byte);
+                    SixelStreamState::DcsData {
+                        action,
+                        raw,
+                        payload,
+                        pending_escape,
+                    }
+                }
+            }
+        };
+    }
+
+    fn finish_dcs(
+        &self,
+        action: u8,
+        raw: Vec<u8>,
+        payload: Vec<u8>,
+        output: &mut Vec<u8>,
+        actions: &mut Vec<SixelStreamAction>,
+    ) {
+        if !output.is_empty() {
+            actions.push(SixelStreamAction::Bytes(std::mem::take(output)));
+        }
+
+        match action {
+            b'q' => actions.push(SixelStreamAction::Sixel(payload)),
+            b't' => actions.push(SixelStreamAction::TmuxPassthrough { payload, raw }),
+            _ => actions.push(SixelStreamAction::UnknownDcs(raw)),
+        }
+    }
+}
+
 fn parse_font_fallbacks(raw: &[String]) -> Option<FontFallbacks> {
     let fallbacks = font_fallback_families(raw);
     if fallbacks.is_empty() {
@@ -1323,6 +1795,11 @@ mod tests {
             bytes: bytes.clone(),
         })));
         (writer, bytes)
+    }
+
+    fn dummy_render_image() -> Arc<RenderImage> {
+        let pixels = image::RgbaImage::from_raw(1, 1, vec![0, 0, 0, 255]).unwrap();
+        Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))
     }
 
     #[test]
@@ -1401,6 +1878,248 @@ mod tests {
             PendingTerminalEvent::ClipboardLoad(ClipboardType::Clipboard, _) => {}
             _ => panic!("expected clipboard load event"),
         }
+    }
+
+    #[test]
+    fn sixel_stream_parser_extracts_sixel_and_preserves_text() {
+        let mut parser = SixelStreamParser::default();
+        let actions = parser.advance(b"before\x1bPq~\x1b\\after");
+
+        assert_eq!(actions.len(), 3);
+        match &actions[0] {
+            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"before"),
+            _ => panic!("expected leading text"),
+        }
+        match &actions[1] {
+            SixelStreamAction::Sixel(payload) => assert_eq!(payload, b"~"),
+            _ => panic!("expected sixel payload"),
+        }
+        match &actions[2] {
+            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"after"),
+            _ => panic!("expected trailing text"),
+        }
+    }
+
+    #[test]
+    fn sixel_stream_parser_keeps_tmux_escaped_st_until_outer_terminator() {
+        let mut parser = SixelStreamParser::default();
+        let actions = parser.advance(b"before\x1bPtmux;\x1b\x1bPq~\x1b\x1b\\\x1b\\after");
+
+        assert_eq!(actions.len(), 3);
+        match &actions[0] {
+            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"before"),
+            _ => panic!("expected leading text"),
+        }
+        match &actions[1] {
+            SixelStreamAction::TmuxPassthrough { payload, .. } => {
+                assert_eq!(payload, b"mux;\x1b\x1bPq~\x1b\x1b\\");
+                assert!(decode_tmux_passthrough_sixel(0, 0, payload).is_some());
+            }
+            _ => panic!("expected tmux passthrough payload"),
+        }
+        match &actions[2] {
+            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"after"),
+            _ => panic!("expected trailing text"),
+        }
+    }
+
+    #[test]
+    fn sixel_layout_reservation_places_following_text_below_image() {
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize { cols: 80, rows: 6 },
+            TitleTrackingListener {
+                title,
+                writer: None,
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+        let mut parser = SixelStreamParser::default();
+        let actions = parser.advance(b"before\r\n\x1bPq\"1;1;1;36#1~\x1b\\after");
+
+        for action in actions {
+            match action {
+                SixelStreamAction::Bytes(bytes) => processor.advance(&mut term, &bytes),
+                SixelStreamAction::Sixel(payload) => {
+                    let content = term.renderable_content();
+                    let row = (content.cursor.point.line.0 + content.display_offset as i32).max(0)
+                        as usize;
+                    let col = content.cursor.point.column.0;
+                    let image = decode_sixel_payload(row, col, &payload).unwrap();
+                    reserve_sixel_layout(
+                        &mut processor,
+                        &mut term,
+                        sixel_occupied_cols(image.width, px(8.0)),
+                        sixel_occupied_rows(image.height, px(18.0)),
+                        row,
+                    );
+                }
+                _ => panic!("unexpected stream action"),
+            }
+        }
+
+        let rendered: String = (0..5)
+            .map(|col| term.grid()[Line(3)][Column(col)].c)
+            .collect();
+        assert_eq!(rendered, "after");
+    }
+
+    #[test]
+    fn sixel_layout_reservation_reports_scroll_when_image_starts_at_bottom() {
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize { cols: 80, rows: 4 },
+            TitleTrackingListener {
+                title,
+                writer: None,
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        processor.advance(&mut term, b"\x1b[4;1H");
+        let scrolled_rows = reserve_sixel_layout(&mut processor, &mut term, 1, 2, 3);
+        processor.advance(&mut term, b"after");
+
+        let rendered: String = (0..5)
+            .map(|col| term.grid()[Line(3)][Column(col)].c)
+            .collect();
+        assert_eq!(scrolled_rows, 2);
+        assert_eq!(rendered, "after");
+    }
+
+    #[test]
+    fn sixel_images_follow_normal_text_scrollback() {
+        let title = Arc::new(Mutex::new(None));
+        let pending_events = Arc::new(Mutex::new(Vec::new()));
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize { cols: 80, rows: 4 },
+            TitleTrackingListener {
+                title,
+                writer: None,
+                pending_events,
+            },
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+        let mut images = vec![TerminalImage {
+            row: 2,
+            col: 0,
+            cols: 1,
+            rows: 3,
+            image: dummy_render_image(),
+        }];
+
+        processor.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour");
+        let old_history_size = term.grid().history_size();
+        processor.advance(&mut term, b"\r\nfive");
+        let new_history_size = term.grid().history_size();
+        if new_history_size > old_history_size {
+            scroll_images_in_region(
+                &mut images,
+                0,
+                usize::MAX / 2,
+                -((new_history_size - old_history_size) as i32),
+            );
+        }
+
+        assert_eq!(images[0].row, 1);
+
+        processor.advance(&mut term, b"\r\nsix\r\nseven\r\neight");
+        let next_history_size = term.grid().history_size();
+        if next_history_size > new_history_size {
+            scroll_images_in_region(
+                &mut images,
+                0,
+                usize::MAX / 2,
+                -((next_history_size - new_history_size) as i32),
+            );
+        }
+
+        assert_eq!(images[0].row, -2);
+
+        processor.advance(&mut term, b"\r\nnine");
+        let final_history_size = term.grid().history_size();
+        if final_history_size > next_history_size {
+            scroll_images_in_region(
+                &mut images,
+                0,
+                usize::MAX / 2,
+                -((final_history_size - next_history_size) as i32),
+            );
+        }
+
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn terminal_region_scroll_moves_intersecting_sixel_images() {
+        let mut images = vec![
+            TerminalImage {
+                row: 2,
+                col: 0,
+                cols: 1,
+                rows: 2,
+                image: dummy_render_image(),
+            },
+            TerminalImage {
+                row: 5,
+                col: 0,
+                cols: 1,
+                rows: 1,
+                image: dummy_render_image(),
+            },
+        ];
+
+        scroll_images_in_region(&mut images, 1, 4, -1);
+
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].row, 1);
+        assert_eq!(images[1].row, 5);
+
+        scroll_images_in_region(&mut images, 1, 4, -3);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].row, 5);
+    }
+
+    #[test]
+    fn terminal_erase_removes_intersecting_sixel_images() {
+        let mut images = vec![
+            TerminalImage {
+                row: 2,
+                col: 0,
+                cols: 1,
+                rows: 2,
+                image: dummy_render_image(),
+            },
+            TerminalImage {
+                row: 5,
+                col: 0,
+                cols: 1,
+                rows: 1,
+                image: dummy_render_image(),
+            },
+        ];
+
+        erase_images_in_region(&mut images, 0, 4);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].row, 5);
+    }
+
+    #[test]
+    fn pty_pixel_size_matches_rendered_grid_cell_area() {
+        let pixel_size =
+            pty_pixel_size_for_grid(GridSize { cols: 80, rows: 24 }, px(7.5), px(18.0));
+
+        assert_eq!(pixel_size.width, 600);
+        assert_eq!(pixel_size.height, 432);
     }
 
     #[test]
@@ -1542,6 +2261,19 @@ mod tests {
             links,
             vec![(5, 33, "https://example.com/path?q=1".to_string())]
         );
+    }
+
+    #[test]
+    fn cell_style_flags_preserve_terminal_text_styles() {
+        let (bold, italic, underline, undercurl, strikethrough) = cell_style_flags(
+            Flags::BOLD | Flags::ITALIC | Flags::UNDERLINE | Flags::UNDERCURL | Flags::STRIKEOUT,
+        );
+
+        assert!(bold);
+        assert!(italic);
+        assert!(underline);
+        assert!(undercurl);
+        assert!(strikethrough);
     }
 
     #[test]

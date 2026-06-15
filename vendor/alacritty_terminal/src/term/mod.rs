@@ -746,7 +746,10 @@ impl<T> Term<T> {
     /// Text moves down; clear at bottom
     /// Expects origin to be in scroll range.
     #[inline]
-    fn scroll_down_relative(&mut self, origin: Line, mut lines: usize) {
+    fn scroll_down_relative(&mut self, origin: Line, mut lines: usize)
+    where
+        T: EventListener,
+    {
         trace!("Scrolling down relative: origin={origin}, lines={lines}");
 
         lines = cmp::min(lines, (self.scroll_region.end - self.scroll_region.start).0 as usize);
@@ -766,6 +769,11 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        self.event_proxy.send_event(Event::Scroll {
+            region_top: region.start.0.max(0) as usize,
+            region_bottom: region.end.0.max(0) as usize,
+            delta: lines as i32,
+        });
         self.mark_fully_damaged();
     }
 
@@ -774,7 +782,10 @@ impl<T> Term<T> {
     /// Text moves up; clear at top
     /// Expects origin to be in scroll range.
     #[inline]
-    fn scroll_up_relative(&mut self, origin: Line, mut lines: usize) {
+    fn scroll_up_relative(&mut self, origin: Line, mut lines: usize)
+    where
+        T: EventListener,
+    {
         trace!("Scrolling up relative: origin={origin}, lines={lines}");
 
         lines = cmp::min(lines, (self.scroll_region.end - self.scroll_region.start).0 as usize);
@@ -785,6 +796,11 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        self.event_proxy.send_event(Event::Scroll {
+            region_top: region.start.0.max(0) as usize,
+            region_bottom: region.end.0.max(0) as usize,
+            delta: -(lines as i32),
+        });
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -1269,7 +1285,7 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                let text = String::from("\x1b[?62;4c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {
@@ -1664,6 +1680,11 @@ impl<T: EventListener> Handler for Term<T> {
             *cell = bg.into();
         }
 
+        self.event_proxy.send_event(Event::Erase {
+            region_top: point.line.0.max(0) as usize,
+            region_bottom: point.line.0.max(0) as usize + 1,
+        });
+
         let range = self.grid.cursor.point.line..=self.grid.cursor.point.line;
         self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
     }
@@ -1782,6 +1803,10 @@ impl<T: EventListener> Handler for Term<T> {
 
                 let range = Line(0)..=cursor.line;
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+                self.event_proxy.send_event(Event::Erase {
+                    region_top: 0,
+                    region_bottom: (cursor.line.0.max(0) as usize + 1).min(screen_lines),
+                });
             },
             ansi::ClearMode::Below => {
                 let cursor = self.grid.cursor.point;
@@ -1795,6 +1820,10 @@ impl<T: EventListener> Handler for Term<T> {
 
                 let range = cursor.line..Line(screen_lines as i32);
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+                self.event_proxy.send_event(Event::Erase {
+                    region_top: (cursor.line.0.max(0) as usize).min(screen_lines),
+                    region_bottom: screen_lines,
+                });
             },
             ansi::ClearMode::All => {
                 if self.mode.contains(TermMode::ALT_SCREEN) {
@@ -1812,6 +1841,10 @@ impl<T: EventListener> Handler for Term<T> {
                 }
 
                 self.selection = None;
+                self.event_proxy.send_event(Event::Erase {
+                    region_top: 0,
+                    region_bottom: screen_lines,
+                });
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();

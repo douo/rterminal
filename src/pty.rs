@@ -9,6 +9,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 pub(crate) type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+const DEFAULT_CHILD_TERM: &str = "xterm-256color";
+
 pub(crate) struct PtySession {
     pub(crate) master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub(crate) writer: SharedPtyWriter,
@@ -18,20 +20,24 @@ pub(crate) struct PtySession {
 }
 
 impl PtySession {
-    pub(crate) fn spawn(rows: u16, cols: u16) -> Result<Self> {
+    pub(crate) fn spawn(rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let system = native_pty_system();
         let pair = system
             .openpty(PtySize {
                 rows,
                 cols,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width,
+                pixel_height,
             })
             .context("failed to create PTY")?;
 
         let mut command = CommandBuilder::new(shell.clone());
         command.arg("-i");
+        command.env("TERM", child_term());
+        command.env("COLORTERM", "truecolor");
+        command.env("TERM_PROGRAM", "rterminal");
+        command.env_remove("NO_COLOR");
 
         let child = pair
             .slave
@@ -84,4 +90,21 @@ pub(crate) fn write_to_pty(writer: &SharedPtyWriter, bytes: &[u8]) -> Result<()>
         .context("failed to write bytes to PTY")?;
     writer.flush().context("failed to flush PTY writer")?;
     Ok(())
+}
+
+fn child_term() -> String {
+    std::env::var("AGENT_TUI_TERM")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CHILD_TERM.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_CHILD_TERM;
+
+    #[test]
+    fn default_child_term_uses_xterm_standout() {
+        assert_eq!(DEFAULT_CHILD_TERM, "xterm-256color");
+    }
 }

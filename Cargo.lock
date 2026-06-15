@@ -41,6 +41,7 @@ dependencies = [
  "fontdb",
  "gpui",
  "gpui_platform",
+ "image",
  "objc",
  "parking_lot",
  "portable-pty",

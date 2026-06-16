@@ -15,8 +15,8 @@ use alacritty_terminal::vte::ansi::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, FontFallbacks, Pixels, RenderImage,
-    Subscription, Task, Window, px,
+    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, FontFallbacks, Pixels, Subscription,
+    Task, Window, px,
 };
 use parking_lot::Mutex;
 use portable_pty::{Child, MasterPty, PtySize};
@@ -34,6 +34,9 @@ use crate::pty::{PtySession, SharedPtyWriter, write_to_pty};
 use crate::render::{
     CUSTOM_TITLE_BAR_HEIGHT, STATUS_BAR_HEIGHT, TEXT_PADDING_X, TEXT_PADDING_Y, line_height_for,
     measure_cell_width,
+};
+use crate::sixel::{
+    PtyPixelSize, SixelStreamAction, SixelStreamParser, TerminalImages, pty_pixel_size_for_grid,
 };
 use crate::snapshot_tab::SnapshotTabData;
 use crate::text_utils::summarize_text_for_trace;
@@ -173,15 +176,6 @@ impl EventListener for TitleTrackingListener {
 }
 
 #[derive(Clone)]
-pub(crate) struct TerminalImage {
-    pub(crate) row: isize,
-    pub(crate) col: usize,
-    pub(crate) cols: usize,
-    pub(crate) rows: usize,
-    pub(crate) image: Arc<RenderImage>,
-}
-
-#[derive(Clone)]
 pub(crate) struct CellSnapshot {
     pub(crate) ch: char,
     pub(crate) zerowidth: Vec<char>,
@@ -277,7 +271,7 @@ pub(crate) struct AgentTerminal {
     sixel_parser: SixelStreamParser,
     pub(crate) grid_size: GridSize,
     pub(crate) snapshot: ScreenSnapshot,
-    pub(crate) images: Vec<TerminalImage>,
+    pub(crate) images: TerminalImages,
     pub(crate) cursor_shape: CursorShape,
     pub(crate) force_vertical_cursor: bool,
     pub(crate) cursor_slide_enabled: bool,
@@ -454,7 +448,7 @@ impl AgentTerminal {
             sixel_parser: SixelStreamParser::default(),
             grid_size,
             snapshot: ScreenSnapshot::default(),
-            images: Vec::new(),
+            images: TerminalImages::new(),
             cursor_shape: CursorShape::Block,
             force_vertical_cursor: cli.force_vertical_cursor,
             cursor_slide_enabled: !cli.no_cursor_slide,
@@ -636,56 +630,40 @@ impl AgentTerminal {
                     region_bottom,
                     delta,
                 } => {
-                    scroll_images_in_region(&mut self.images, region_top, region_bottom, delta);
+                    self.images.scroll_region(region_top, region_bottom, delta);
                 }
                 PendingTerminalEvent::Erase {
                     region_top,
                     region_bottom,
                 } => {
-                    erase_images_in_region(&mut self.images, region_top, region_bottom);
+                    self.images.erase_region(region_top, region_bottom);
                 }
             }
         }
     }
 
     fn store_sixel_image(&mut self, image: SixelImage) {
-        let row = image.row;
-        let col = image.col;
-        let width = image.width;
-        let height = image.height;
+        let (width, height, row, col) = (image.width, image.height, image.row, image.col);
+        let cell_width = self.cell_width;
         let line_height = self.line_height();
-        let occupied_cols = sixel_occupied_cols(width, self.cell_width);
-        let occupied_rows = sixel_occupied_rows(height, line_height);
-        let Some(render_image) = render_image_from_sixel(&image) else {
+        let stored = self.images.store(
+            &image,
+            cell_width,
+            line_height,
+            &mut self.processor,
+            &mut self.term,
+        );
+        if stored {
+            self.debug.set_note(Some(format!(
+                "sixel image {}x{} at {},{}",
+                width, height, row, col
+            )));
+        } else {
             self.debug.set_error(format!(
                 "invalid sixel image {}x{} at {},{}",
                 width, height, row, col
             ));
-            return;
-        };
-
-        self.images.push(TerminalImage {
-            row: row as isize,
-            col,
-            cols: occupied_cols,
-            rows: occupied_rows,
-            image: render_image,
-        });
-        if self.images.len() > 128 {
-            let remove_count = self.images.len() - 128;
-            self.images.drain(0..remove_count);
         }
-        reserve_sixel_layout(
-            &mut self.processor,
-            &mut self.term,
-            occupied_cols,
-            occupied_rows,
-            row,
-        );
-        self.debug.set_note(Some(format!(
-            "sixel image {}x{} at {},{}",
-            width, height, row, col
-        )));
     }
 
     fn current_cursor_anchor(&self) -> (usize, usize) {
@@ -1456,283 +1434,6 @@ fn is_input_trace_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn render_image_from_sixel(sixel: &SixelImage) -> Option<Arc<RenderImage>> {
-    if sixel.width == 0 || sixel.height == 0 || sixel.rgba.len() != sixel.width * sixel.height * 4 {
-        return None;
-    }
-
-    let mut bgra = sixel.rgba.clone();
-    for pixel in bgra.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-
-    let pixels = image::RgbaImage::from_raw(sixel.width as u32, sixel.height as u32, bgra)?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
-}
-
-fn reserve_sixel_layout<T: EventListener>(
-    processor: &mut Processor<StdSyncHandler>,
-    term: &mut Term<T>,
-    occupied_cols: usize,
-    occupied_rows: usize,
-    anchor_row: usize,
-) -> usize {
-    let mut reservation = Vec::with_capacity(32);
-    if occupied_cols > 0 {
-        reservation.extend_from_slice(format!("\x1b[{}C", occupied_cols).as_bytes());
-    }
-    if occupied_rows > 1 {
-        reservation.extend_from_slice(format!("\x1b[{}B", occupied_rows - 1).as_bytes());
-    }
-    reservation.push(b'\r');
-    reservation.push(b'\n');
-    processor.advance(term, &reservation);
-
-    let content = term.renderable_content();
-    let cursor_row = (content.cursor.point.line.0 + content.display_offset as i32).max(0) as usize;
-    anchor_row
-        .saturating_add(occupied_rows)
-        .saturating_sub(cursor_row)
-}
-
-fn sixel_occupied_cols(image_width: usize, cell_width: Pixels) -> usize {
-    let cell_width = f32::from(cell_width.max(px(1.0)));
-    ((image_width as f32) / cell_width).ceil().max(1.0) as usize
-}
-
-fn sixel_occupied_rows(image_height: usize, line_height: Pixels) -> usize {
-    let line_height = f32::from(line_height.max(px(1.0)));
-    ((image_height as f32) / line_height).ceil().max(1.0) as usize
-}
-
-fn scroll_images_in_region(
-    images: &mut Vec<TerminalImage>,
-    region_top: usize,
-    region_bottom: usize,
-    delta: i32,
-) {
-    if delta == 0 || region_top >= region_bottom {
-        return;
-    }
-
-    let region_top = region_top as isize;
-    let region_bottom = region_bottom as isize;
-    let delta = delta as isize;
-    *images = images
-        .drain(..)
-        .filter_map(|mut image| {
-            let image_bottom = image.row + image.rows as isize;
-            let intersects_region = image.row < region_bottom && image_bottom > region_top;
-            if !intersects_region {
-                return Some(image);
-            }
-
-            image.row += delta;
-            let image_bottom = image.row + image.rows as isize;
-            if image.row >= region_bottom || image_bottom <= region_top {
-                return None;
-            }
-
-            Some(image)
-        })
-        .collect();
-}
-
-fn erase_images_in_region(images: &mut Vec<TerminalImage>, region_top: usize, region_bottom: usize) {
-    if region_top >= region_bottom {
-        return;
-    }
-
-    let region_top = region_top as isize;
-    let region_bottom = region_bottom as isize;
-    images.retain(|image| {
-        let image_bottom = image.row + image.rows as isize;
-        !(image.row < region_bottom && image_bottom > region_top)
-    });
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PtyPixelSize {
-    width: u16,
-    height: u16,
-}
-
-pub(crate) fn pty_pixel_size_for_grid(
-    grid_size: GridSize,
-    cell_width: Pixels,
-    line_height: Pixels,
-) -> PtyPixelSize {
-    PtyPixelSize {
-        width: pixels_to_pty_size(cell_width * grid_size.cols as f32),
-        height: pixels_to_pty_size(line_height * grid_size.rows as f32),
-    }
-}
-
-fn pixels_to_pty_size(value: Pixels) -> u16 {
-    f32::from(value).round().clamp(1.0, u16::MAX as f32) as u16
-}
-
-#[derive(Default)]
-struct SixelStreamParser {
-    state: SixelStreamState,
-}
-
-enum SixelStreamAction {
-    Bytes(Vec<u8>),
-    Sixel(Vec<u8>),
-    TmuxPassthrough { payload: Vec<u8>, raw: Vec<u8> },
-    UnknownDcs(Vec<u8>),
-}
-
-#[derive(Default)]
-enum SixelStreamState {
-    #[default]
-    Ground,
-    Escape,
-    DcsEntry {
-        raw: Vec<u8>,
-    },
-    DcsData {
-        action: u8,
-        raw: Vec<u8>,
-        payload: Vec<u8>,
-        pending_escape: bool,
-    },
-}
-
-impl SixelStreamParser {
-    fn advance(&mut self, bytes: &[u8]) -> Vec<SixelStreamAction> {
-        let mut actions = Vec::new();
-        let mut output = Vec::new();
-
-        for byte in bytes.iter().copied() {
-            self.advance_byte(byte, &mut output, &mut actions);
-        }
-
-        if !output.is_empty() {
-            actions.push(SixelStreamAction::Bytes(output));
-        }
-        actions
-    }
-
-    fn advance_byte(
-        &mut self,
-        byte: u8,
-        output: &mut Vec<u8>,
-        actions: &mut Vec<SixelStreamAction>,
-    ) {
-        let state = std::mem::take(&mut self.state);
-        self.state = match state {
-            SixelStreamState::Ground => {
-                if byte == 0x1b {
-                    SixelStreamState::Escape
-                } else {
-                    output.push(byte);
-                    SixelStreamState::Ground
-                }
-            }
-            SixelStreamState::Escape => match byte {
-                b'P' => SixelStreamState::DcsEntry {
-                    raw: vec![0x1b, b'P'],
-                },
-                0x1b => {
-                    output.push(0x1b);
-                    SixelStreamState::Escape
-                }
-                _ => {
-                    output.push(0x1b);
-                    output.push(byte);
-                    SixelStreamState::Ground
-                }
-            },
-            SixelStreamState::DcsEntry { mut raw } => {
-                raw.push(byte);
-                if (0x40..=0x7e).contains(&byte) {
-                    SixelStreamState::DcsData {
-                        action: byte,
-                        raw,
-                        payload: Vec::new(),
-                        pending_escape: false,
-                    }
-                } else {
-                    SixelStreamState::DcsEntry { raw }
-                }
-            }
-            SixelStreamState::DcsData {
-                action,
-                mut raw,
-                mut payload,
-                mut pending_escape,
-            } => {
-                raw.push(byte);
-                if byte == 0x9c {
-                    self.finish_dcs(action, raw, payload, output, actions);
-                    SixelStreamState::Ground
-                } else if pending_escape {
-                    if action == b't' && byte == 0x1b {
-                        payload.push(0x1b);
-                        payload.push(byte);
-                        SixelStreamState::DcsData {
-                            action,
-                            raw,
-                            payload,
-                            pending_escape: false,
-                        }
-                    } else if byte == b'\\' {
-                        self.finish_dcs(action, raw, payload, output, actions);
-                        SixelStreamState::Ground
-                    } else {
-                        payload.push(0x1b);
-                        payload.push(byte);
-                        pending_escape = byte == 0x1b;
-                        SixelStreamState::DcsData {
-                            action,
-                            raw,
-                            payload,
-                            pending_escape,
-                        }
-                    }
-                } else if byte == 0x1b {
-                    pending_escape = true;
-                    SixelStreamState::DcsData {
-                        action,
-                        raw,
-                        payload,
-                        pending_escape,
-                    }
-                } else {
-                    payload.push(byte);
-                    SixelStreamState::DcsData {
-                        action,
-                        raw,
-                        payload,
-                        pending_escape,
-                    }
-                }
-            }
-        };
-    }
-
-    fn finish_dcs(
-        &self,
-        action: u8,
-        raw: Vec<u8>,
-        payload: Vec<u8>,
-        output: &mut Vec<u8>,
-        actions: &mut Vec<SixelStreamAction>,
-    ) {
-        if !output.is_empty() {
-            actions.push(SixelStreamAction::Bytes(std::mem::take(output)));
-        }
-
-        match action {
-            b'q' => actions.push(SixelStreamAction::Sixel(payload)),
-            b't' => actions.push(SixelStreamAction::TmuxPassthrough { payload, raw }),
-            _ => actions.push(SixelStreamAction::UnknownDcs(raw)),
-        }
-    }
-}
-
 fn parse_font_fallbacks(raw: &[String]) -> Option<FontFallbacks> {
     let fallbacks = font_fallback_families(raw);
     if fallbacks.is_empty() {
@@ -1795,11 +1496,6 @@ mod tests {
             bytes: bytes.clone(),
         })));
         (writer, bytes)
-    }
-
-    fn dummy_render_image() -> Arc<RenderImage> {
-        let pixels = image::RgbaImage::from_raw(1, 1, vec![0, 0, 0, 255]).unwrap();
-        Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]))
     }
 
     #[test]
@@ -1878,248 +1574,6 @@ mod tests {
             PendingTerminalEvent::ClipboardLoad(ClipboardType::Clipboard, _) => {}
             _ => panic!("expected clipboard load event"),
         }
-    }
-
-    #[test]
-    fn sixel_stream_parser_extracts_sixel_and_preserves_text() {
-        let mut parser = SixelStreamParser::default();
-        let actions = parser.advance(b"before\x1bPq~\x1b\\after");
-
-        assert_eq!(actions.len(), 3);
-        match &actions[0] {
-            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"before"),
-            _ => panic!("expected leading text"),
-        }
-        match &actions[1] {
-            SixelStreamAction::Sixel(payload) => assert_eq!(payload, b"~"),
-            _ => panic!("expected sixel payload"),
-        }
-        match &actions[2] {
-            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"after"),
-            _ => panic!("expected trailing text"),
-        }
-    }
-
-    #[test]
-    fn sixel_stream_parser_keeps_tmux_escaped_st_until_outer_terminator() {
-        let mut parser = SixelStreamParser::default();
-        let actions = parser.advance(b"before\x1bPtmux;\x1b\x1bPq~\x1b\x1b\\\x1b\\after");
-
-        assert_eq!(actions.len(), 3);
-        match &actions[0] {
-            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"before"),
-            _ => panic!("expected leading text"),
-        }
-        match &actions[1] {
-            SixelStreamAction::TmuxPassthrough { payload, .. } => {
-                assert_eq!(payload, b"mux;\x1b\x1bPq~\x1b\x1b\\");
-                assert!(decode_tmux_passthrough_sixel(0, 0, payload).is_some());
-            }
-            _ => panic!("expected tmux passthrough payload"),
-        }
-        match &actions[2] {
-            SixelStreamAction::Bytes(bytes) => assert_eq!(bytes, b"after"),
-            _ => panic!("expected trailing text"),
-        }
-    }
-
-    #[test]
-    fn sixel_layout_reservation_places_following_text_below_image() {
-        let title = Arc::new(Mutex::new(None));
-        let pending_events = Arc::new(Mutex::new(Vec::new()));
-        let mut term = Term::new(
-            Config::default(),
-            &GridSize { cols: 80, rows: 6 },
-            TitleTrackingListener {
-                title,
-                writer: None,
-                pending_events,
-            },
-        );
-        let mut processor = Processor::<StdSyncHandler>::new();
-        let mut parser = SixelStreamParser::default();
-        let actions = parser.advance(b"before\r\n\x1bPq\"1;1;1;36#1~\x1b\\after");
-
-        for action in actions {
-            match action {
-                SixelStreamAction::Bytes(bytes) => processor.advance(&mut term, &bytes),
-                SixelStreamAction::Sixel(payload) => {
-                    let content = term.renderable_content();
-                    let row = (content.cursor.point.line.0 + content.display_offset as i32).max(0)
-                        as usize;
-                    let col = content.cursor.point.column.0;
-                    let image = decode_sixel_payload(row, col, &payload).unwrap();
-                    reserve_sixel_layout(
-                        &mut processor,
-                        &mut term,
-                        sixel_occupied_cols(image.width, px(8.0)),
-                        sixel_occupied_rows(image.height, px(18.0)),
-                        row,
-                    );
-                }
-                _ => panic!("unexpected stream action"),
-            }
-        }
-
-        let rendered: String = (0..5)
-            .map(|col| term.grid()[Line(3)][Column(col)].c)
-            .collect();
-        assert_eq!(rendered, "after");
-    }
-
-    #[test]
-    fn sixel_layout_reservation_reports_scroll_when_image_starts_at_bottom() {
-        let title = Arc::new(Mutex::new(None));
-        let pending_events = Arc::new(Mutex::new(Vec::new()));
-        let mut term = Term::new(
-            Config::default(),
-            &GridSize { cols: 80, rows: 4 },
-            TitleTrackingListener {
-                title,
-                writer: None,
-                pending_events,
-            },
-        );
-        let mut processor = Processor::<StdSyncHandler>::new();
-
-        processor.advance(&mut term, b"\x1b[4;1H");
-        let scrolled_rows = reserve_sixel_layout(&mut processor, &mut term, 1, 2, 3);
-        processor.advance(&mut term, b"after");
-
-        let rendered: String = (0..5)
-            .map(|col| term.grid()[Line(3)][Column(col)].c)
-            .collect();
-        assert_eq!(scrolled_rows, 2);
-        assert_eq!(rendered, "after");
-    }
-
-    #[test]
-    fn sixel_images_follow_normal_text_scrollback() {
-        let title = Arc::new(Mutex::new(None));
-        let pending_events = Arc::new(Mutex::new(Vec::new()));
-        let mut term = Term::new(
-            Config::default(),
-            &GridSize { cols: 80, rows: 4 },
-            TitleTrackingListener {
-                title,
-                writer: None,
-                pending_events,
-            },
-        );
-        let mut processor = Processor::<StdSyncHandler>::new();
-        let mut images = vec![TerminalImage {
-            row: 2,
-            col: 0,
-            cols: 1,
-            rows: 3,
-            image: dummy_render_image(),
-        }];
-
-        processor.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour");
-        let old_history_size = term.grid().history_size();
-        processor.advance(&mut term, b"\r\nfive");
-        let new_history_size = term.grid().history_size();
-        if new_history_size > old_history_size {
-            scroll_images_in_region(
-                &mut images,
-                0,
-                usize::MAX / 2,
-                -((new_history_size - old_history_size) as i32),
-            );
-        }
-
-        assert_eq!(images[0].row, 1);
-
-        processor.advance(&mut term, b"\r\nsix\r\nseven\r\neight");
-        let next_history_size = term.grid().history_size();
-        if next_history_size > new_history_size {
-            scroll_images_in_region(
-                &mut images,
-                0,
-                usize::MAX / 2,
-                -((next_history_size - new_history_size) as i32),
-            );
-        }
-
-        assert_eq!(images[0].row, -2);
-
-        processor.advance(&mut term, b"\r\nnine");
-        let final_history_size = term.grid().history_size();
-        if final_history_size > next_history_size {
-            scroll_images_in_region(
-                &mut images,
-                0,
-                usize::MAX / 2,
-                -((final_history_size - next_history_size) as i32),
-            );
-        }
-
-        assert!(images.is_empty());
-    }
-
-    #[test]
-    fn terminal_region_scroll_moves_intersecting_sixel_images() {
-        let mut images = vec![
-            TerminalImage {
-                row: 2,
-                col: 0,
-                cols: 1,
-                rows: 2,
-                image: dummy_render_image(),
-            },
-            TerminalImage {
-                row: 5,
-                col: 0,
-                cols: 1,
-                rows: 1,
-                image: dummy_render_image(),
-            },
-        ];
-
-        scroll_images_in_region(&mut images, 1, 4, -1);
-
-        assert_eq!(images.len(), 2);
-        assert_eq!(images[0].row, 1);
-        assert_eq!(images[1].row, 5);
-
-        scroll_images_in_region(&mut images, 1, 4, -3);
-
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].row, 5);
-    }
-
-    #[test]
-    fn terminal_erase_removes_intersecting_sixel_images() {
-        let mut images = vec![
-            TerminalImage {
-                row: 2,
-                col: 0,
-                cols: 1,
-                rows: 2,
-                image: dummy_render_image(),
-            },
-            TerminalImage {
-                row: 5,
-                col: 0,
-                cols: 1,
-                rows: 1,
-                image: dummy_render_image(),
-            },
-        ];
-
-        erase_images_in_region(&mut images, 0, 4);
-
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].row, 5);
-    }
-
-    #[test]
-    fn pty_pixel_size_matches_rendered_grid_cell_area() {
-        let pixel_size =
-            pty_pixel_size_for_grid(GridSize { cols: 80, rows: 24 }, px(7.5), px(18.0));
-
-        assert_eq!(pixel_size.width, 600);
-        assert_eq!(pixel_size.height, 432);
     }
 
     #[test]

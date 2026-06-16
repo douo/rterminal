@@ -10,6 +10,7 @@ mod keyboard;
 mod macos_ax;
 mod pty;
 mod render;
+mod sixel;
 mod snapshot_tab;
 mod tabs;
 mod terminal;

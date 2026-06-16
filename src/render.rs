@@ -412,7 +412,7 @@ impl Render for AgentTerminal {
                         }
 
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                            for image in &images {
+                            for image in images.iter() {
                                 if image.row >= snapshot.cells.len() as isize
                                     || image.row + image.rows as isize <= 0
                                 {

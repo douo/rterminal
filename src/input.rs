@@ -1595,9 +1595,10 @@ impl EntityInputHandler for AgentTerminal {
             .map(|text| 0..text.encode_utf16().count())
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ime_marked_text = None;
         self.trace_input("ime unmark_text");
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 
@@ -1605,7 +1606,7 @@ impl EntityInputHandler for AgentTerminal {
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.ime_marked_text = None;
@@ -1636,6 +1637,7 @@ impl EntityInputHandler for AgentTerminal {
                 "after_cursor_utf16": self.input_cursor_utf16,
             }),
         );
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 
@@ -1644,7 +1646,7 @@ impl EntityInputHandler for AgentTerminal {
         _range: Option<Range<usize>>,
         new_text: &str,
         _new_selected_range: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.trace_input(format!("ime replace_and_mark_text len={}", new_text.len()));
@@ -1653,6 +1655,7 @@ impl EntityInputHandler for AgentTerminal {
         } else {
             Some(new_text.to_string())
         };
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 

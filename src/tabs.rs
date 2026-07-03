@@ -92,6 +92,7 @@ pub(crate) struct TerminalTabs {
     focus_handle: gpui::FocusHandle,
     renaming_tab_id: Option<usize>,
     rename_buffer: String,
+    _activation_sub: Option<Subscription>,
 }
 
 impl TerminalTabs {
@@ -106,8 +107,15 @@ impl TerminalTabs {
             focus_handle: cx.focus_handle(),
             renaming_tab_id: None,
             rename_buffer: String::new(),
+            _activation_sub: None,
         };
 
+        this._activation_sub = Some(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && this.renaming_tab_id.is_none() {
+                this.request_focus_active_tab(window, cx);
+                cx.notify();
+            }
+        }));
         this.open_new_tab(window, cx);
         this
     }

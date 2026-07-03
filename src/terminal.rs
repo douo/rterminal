@@ -511,14 +511,14 @@ impl AgentTerminal {
             this.sync_grid_to_window(window);
             cx.notify();
         }));
-        this._focus_in_sub = Some(
-            cx.on_focus(&this.focus_handle, window, |this, _window, _cx| {
-                this.last_focus_in_at = Some(Instant::now());
-                if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
-                    this.write_bytes(b"\x1b[I");
-                }
-            }),
-        );
+        this._focus_in_sub = Some(cx.on_focus(&this.focus_handle, window, |this, window, cx| {
+            this.last_focus_in_at = Some(Instant::now());
+            if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+                this.write_bytes(b"\x1b[I");
+            }
+            window.invalidate_character_coordinates();
+            cx.notify();
+        }));
         this._focus_out_sub =
             Some(
                 cx.on_focus_out(&this.focus_handle, window, |this, _event, _window, _cx| {

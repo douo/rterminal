@@ -6,6 +6,7 @@ use gpui::{
 };
 
 use crate::cli::Theme;
+use crate::convenience::cursor_indicator::cursor_color_for_input_mode;
 use crate::input::selection_contains_cell;
 use crate::{AgentTerminal, AgentTerminalInputHandler};
 
@@ -226,7 +227,12 @@ impl Render for AgentTerminal {
         let line_height = self.line_height();
         let note = self.debug.note();
         let selection = self.selection_bounds();
+        if self.convenience_state.refresh_input_mode_if_due() {
+            cx.notify();
+        }
+        let input_mode = self.convenience_state.input_mode();
         let palette = palette_for(self.theme);
+        let cursor_bg = cursor_color_for_input_mode(palette.cursor_bg, input_mode);
         let terminal_title = self
             .terminal_title
             .lock()
@@ -519,7 +525,7 @@ impl Render for AgentTerminal {
                                                 } else {
                                                     cursor_origin.x + beam_width
                                                 };
-                                            let mut primary_trail_color = palette.cursor_bg;
+                                            let mut primary_trail_color = cursor_bg;
                                             primary_trail_color.a = (primary_trail_color.a
                                                 * CURSOR_TRAIL_PRIMARY_ALPHA_SCALE)
                                                 .clamp(0.0, 1.0);
@@ -543,7 +549,7 @@ impl Render for AgentTerminal {
                                                 } else {
                                                     cursor_origin.x + beam_width
                                                 };
-                                            let mut secondary_trail_color = palette.cursor_bg;
+                                            let mut secondary_trail_color = cursor_bg;
                                             secondary_trail_color.a = (secondary_trail_color.a
                                                 * CURSOR_TRAIL_SECONDARY_ALPHA_SCALE)
                                                 .clamp(0.0, 1.0);
@@ -561,7 +567,7 @@ impl Render for AgentTerminal {
                                     }
                                     window.paint_quad(fill(
                                         Bounds::new(cursor_origin, size(beam_width, line_height)),
-                                        palette.cursor_bg,
+                                        cursor_bg,
                                     ));
                                 }
                                 CursorShape::Underline => {
@@ -575,7 +581,7 @@ impl Render for AgentTerminal {
                                             underline_origin,
                                             size(cell_width_px, underline_height),
                                         ),
-                                        palette.cursor_bg,
+                                        cursor_bg,
                                     ));
                                 }
                                 CursorShape::HollowBlock => {
@@ -584,7 +590,7 @@ impl Render for AgentTerminal {
 
                                     window.paint_quad(fill(
                                         Bounds::new(cursor_origin, size(cell_width_px, border_y)),
-                                        palette.cursor_bg,
+                                        cursor_bg,
                                     ));
                                     window.paint_quad(fill(
                                         Bounds::new(
@@ -594,11 +600,11 @@ impl Render for AgentTerminal {
                                             ),
                                             size(cell_width_px, border_y),
                                         ),
-                                        palette.cursor_bg,
+                                        cursor_bg,
                                     ));
                                     window.paint_quad(fill(
                                         Bounds::new(cursor_origin, size(border_x, line_height)),
-                                        palette.cursor_bg,
+                                        cursor_bg,
                                     ));
                                     window.paint_quad(fill(
                                         Bounds::new(
@@ -608,7 +614,7 @@ impl Render for AgentTerminal {
                                             ),
                                             size(border_x, line_height),
                                         ),
-                                        palette.cursor_bg,
+                                        cursor_bg,
                                     ));
                                 }
                                 CursorShape::Hidden => {}
@@ -618,7 +624,7 @@ impl Render for AgentTerminal {
                                             cursor_origin,
                                             size(cell_width_px, line_height),
                                         ),
-                                        palette.cursor_bg,
+                                        cursor_bg,
                                     ));
                                 }
                             }

@@ -753,6 +753,7 @@ impl AgentTerminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_convenience_state(cx);
         self.trace_input(format!(
             "keydown key={:?} key_char={:?} modifiers={:?}",
             event.keystroke.key, event.keystroke.key_char, event.keystroke.modifiers

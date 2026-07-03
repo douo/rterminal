@@ -26,6 +26,7 @@ use serde_json::json;
 use crate::cli::{AmbiguousWidth, CliOptions, Theme};
 use crate::color::indexed_to_rgb;
 use crate::color::{ansi_bg_to_hsla, ansi_to_hsla};
+use crate::convenience::{ConvenienceState, input_method::InputModeChangeListener};
 use crate::debug_server::{SharedDebugState, start_debug_http_server};
 use crate::font_fallback::font_fallback_families;
 use crate::input_log::InputLogger;
@@ -276,6 +277,7 @@ pub(crate) struct AgentTerminal {
     pub(crate) force_vertical_cursor: bool,
     pub(crate) cursor_slide_enabled: bool,
     pub(crate) cursor_trail_enabled: bool,
+    pub(crate) convenience_state: ConvenienceState,
     pub(crate) option_as_meta: bool,
     pub(crate) cursor_visual_initialized: bool,
     pub(crate) cursor_visual_row: usize,
@@ -326,6 +328,7 @@ pub(crate) struct AgentTerminal {
     pub(crate) _window_bounds_sub: Option<Subscription>,
     pub(crate) _focus_in_sub: Option<Subscription>,
     pub(crate) _focus_out_sub: Option<Subscription>,
+    pub(crate) input_method_watch_task: Option<Task<Result<()>>>,
     pub(crate) _pump_task: Task<Result<()>>,
 }
 
@@ -453,6 +456,7 @@ impl AgentTerminal {
             force_vertical_cursor: cli.force_vertical_cursor,
             cursor_slide_enabled: !cli.no_cursor_slide,
             cursor_trail_enabled: cli.cursor_trail,
+            convenience_state: ConvenienceState::new(),
             option_as_meta: !cli.no_option_as_meta,
             cursor_visual_initialized: false,
             cursor_visual_row: 0,
@@ -503,6 +507,7 @@ impl AgentTerminal {
             _window_bounds_sub: None,
             _focus_in_sub: None,
             _focus_out_sub: None,
+            input_method_watch_task: None,
             _pump_task: Task::ready(Ok(())),
         };
 
@@ -513,6 +518,7 @@ impl AgentTerminal {
         }));
         this._focus_in_sub = Some(cx.on_focus(&this.focus_handle, window, |this, window, cx| {
             this.last_focus_in_at = Some(Instant::now());
+            this.start_input_method_listener(cx);
             if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                 this.write_bytes(b"\x1b[I");
             }
@@ -522,6 +528,7 @@ impl AgentTerminal {
         this._focus_out_sub =
             Some(
                 cx.on_focus_out(&this.focus_handle, window, |this, _event, _window, _cx| {
+                    this.stop_input_method_listener();
                     if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                         this.write_bytes(b"\x1b[O");
                     }
@@ -848,6 +855,42 @@ impl AgentTerminal {
 
     pub(crate) fn line_height(&self) -> Pixels {
         line_height_for(self.font_size)
+    }
+
+    pub(crate) fn refresh_convenience_state(&mut self, cx: &mut Context<Self>) {
+        if self.convenience_state.refresh_input_mode() {
+            cx.notify();
+        }
+    }
+
+    fn start_input_method_listener(&mut self, cx: &mut Context<Self>) {
+        self.refresh_convenience_state(cx);
+
+        if self
+            .input_method_watch_task
+            .as_ref()
+            .is_some_and(|task| !task.is_ready())
+        {
+            return;
+        }
+
+        let Some(listener) = InputModeChangeListener::start() else {
+            self.input_method_watch_task = None;
+            return;
+        };
+
+        self.input_method_watch_task = Some(cx.spawn(async move |this, cx| {
+            while listener.changed().await {
+                this.update(cx, |this, cx| {
+                    this.refresh_convenience_state(cx);
+                })?;
+            }
+            Ok(())
+        }));
+    }
+
+    fn stop_input_method_listener(&mut self) {
+        self.input_method_watch_task.take();
     }
 
     pub(crate) fn adjust_font_size(&mut self, delta: Pixels, window: &mut Window) {

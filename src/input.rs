@@ -587,7 +587,7 @@ impl AgentTerminal {
         cx: &mut Context<Self>,
     ) {
         self.external_file_drag.finish();
-        window.focus(&self.focus_handle, cx);
+        self.restore_focus_and_ime_context(window, cx);
         self.last_mouse_report = None;
         self.trace_input(format!(
             "mouse down button={:?} control={} shift={} alt={} platform={}",

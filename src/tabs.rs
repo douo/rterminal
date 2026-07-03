@@ -48,8 +48,7 @@ impl TerminalTab {
         match &self.kind {
             TerminalTabKind::Terminal { terminal, .. } => {
                 terminal.update(cx, |terminal, cx| {
-                    terminal.refresh_convenience_state(cx);
-                    window.focus(&terminal.focus_handle, cx);
+                    terminal.restore_focus_and_ime_context(window, cx);
                 });
             }
             TerminalTabKind::Snapshot { snapshot } => {

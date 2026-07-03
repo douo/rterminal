@@ -10,6 +10,17 @@ pub(crate) fn current_input_mode() -> InputMode {
     platform::current_input_mode()
 }
 
+pub(crate) fn sync_text_input_context_to_current_source(
+    window: &gpui::Window,
+    discard_marked_text: bool,
+) {
+    platform::sync_text_input_context_to_current_source(window, discard_marked_text);
+}
+
+pub(crate) fn discard_text_input_context_marked_text(window: &gpui::Window) {
+    platform::discard_text_input_context_marked_text(window);
+}
+
 pub(crate) struct InputModeChangeListener {
     receiver: async_channel::Receiver<()>,
     _platform_listener: platform::InputModeChangeListener,
@@ -94,6 +105,12 @@ fn classify_input_source(
 mod platform {
     use super::{InputMode, classify_input_source};
     use async_channel::Sender;
+    use cocoa::{
+        base::{id, nil},
+        foundation::NSString,
+    };
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::RawWindowHandle;
     use std::ffi::{CStr, c_char, c_void};
     use std::ptr;
     use std::sync::Arc;
@@ -165,23 +182,49 @@ mod platform {
 
     pub(super) fn current_input_mode() -> InputMode {
         unsafe {
-            let source = TISCopyCurrentKeyboardInputSource();
-            if source.is_null() {
-                return InputMode::Unknown;
+            current_input_source_snapshot()
+                .map(|snapshot| {
+                    classify_input_source(
+                        (!snapshot.source_id.is_empty()).then_some(snapshot.source_id.as_str()),
+                        (!snapshot.mode_id.is_empty()).then_some(snapshot.mode_id.as_str()),
+                        &snapshot.languages,
+                    )
+                })
+                .unwrap_or(InputMode::Unknown)
+        }
+    }
+
+    pub(super) fn sync_text_input_context_to_current_source(
+        window: &gpui::Window,
+        discard_marked_text: bool,
+    ) {
+        unsafe {
+            let Some(input_context) = text_input_context_for_window(window) else {
+                return;
+            };
+            if discard_marked_text {
+                let _: () = msg_send![input_context, discardMarkedText];
+            }
+            let Some(snapshot) = current_input_source_snapshot() else {
+                return;
+            };
+            if snapshot.source_id.is_empty() {
+                return;
             }
 
-            let source_id =
-                input_source_string_property(source, kTISPropertyInputSourceID).unwrap_or_default();
-            let mode_id =
-                input_source_string_property(source, kTISPropertyInputModeID).unwrap_or_default();
-            let languages = input_source_languages(source);
-            CFRelease(source as CFTypeRef);
+            let source_id = autoreleased_nsstring(&snapshot.source_id);
+            let _: () = msg_send![input_context, setSelectedKeyboardInputSource: source_id];
+            let _: () = msg_send![input_context, invalidateCharacterCoordinates];
+        }
+    }
 
-            classify_input_source(
-                (!source_id.is_empty()).then_some(source_id.as_str()),
-                (!mode_id.is_empty()).then_some(mode_id.as_str()),
-                &languages,
-            )
+    pub(super) fn discard_text_input_context_marked_text(window: &gpui::Window) {
+        unsafe {
+            let Some(input_context) = text_input_context_for_window(window) else {
+                return;
+            };
+            let _: () = msg_send![input_context, discardMarkedText];
+            let _: () = msg_send![input_context, invalidateCharacterCoordinates];
         }
     }
 
@@ -248,6 +291,54 @@ mod platform {
             let observer = Arc::from_raw(observer);
             let _ = observer.sender.try_send(());
         }
+    }
+
+    struct InputSourceSnapshot {
+        source_id: String,
+        mode_id: String,
+        languages: Vec<String>,
+    }
+
+    unsafe fn current_input_source_snapshot() -> Option<InputSourceSnapshot> {
+        let source = unsafe { TISCopyCurrentKeyboardInputSource() };
+        if source.is_null() {
+            return None;
+        }
+
+        let source_id =
+            unsafe { input_source_string_property(source, kTISPropertyInputSourceID) }
+                .unwrap_or_default();
+        let mode_id = unsafe { input_source_string_property(source, kTISPropertyInputModeID) }
+            .unwrap_or_default();
+        let languages = unsafe { input_source_languages(source) };
+        unsafe { CFRelease(source as CFTypeRef) };
+
+        Some(InputSourceSnapshot {
+            source_id,
+            mode_id,
+            languages,
+        })
+    }
+
+    unsafe fn text_input_context_for_window(window: &gpui::Window) -> Option<id> {
+        let window_handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
+        let RawWindowHandle::AppKit(handle) = window_handle.as_raw() else {
+            return None;
+        };
+
+        let ns_view = handle.ns_view.as_ptr() as id;
+        if ns_view == nil {
+            return None;
+        }
+
+        let input_context: id = unsafe { msg_send![ns_view, inputContext] };
+        (input_context != nil).then_some(input_context)
+    }
+
+    #[allow(unexpected_cfgs)]
+    unsafe fn autoreleased_nsstring(value: &str) -> id {
+        let string = unsafe { NSString::alloc(nil).init_str(value) };
+        unsafe { msg_send![string, autorelease] }
     }
 
     unsafe fn input_source_string_property(
@@ -327,6 +418,14 @@ mod platform {
     pub(super) fn current_input_mode() -> InputMode {
         InputMode::Unknown
     }
+
+    pub(super) fn sync_text_input_context_to_current_source(
+        _window: &gpui::Window,
+        _discard_marked_text: bool,
+    ) {
+    }
+
+    pub(super) fn discard_text_input_context_marked_text(_window: &gpui::Window) {}
 
     pub(super) struct InputModeChangeListener;
 

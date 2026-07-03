@@ -26,7 +26,10 @@ use serde_json::json;
 use crate::cli::{AmbiguousWidth, CliOptions, Theme};
 use crate::color::indexed_to_rgb;
 use crate::color::{ansi_bg_to_hsla, ansi_to_hsla};
-use crate::convenience::{ConvenienceState, input_method::InputModeChangeListener};
+use crate::convenience::{
+    ConvenienceState,
+    input_method::{self, InputModeChangeListener},
+};
 use crate::debug_server::{SharedDebugState, start_debug_http_server};
 use crate::font_fallback::font_fallback_families;
 use crate::input::ExternalFileDragState;
@@ -525,13 +528,13 @@ impl AgentTerminal {
             if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                 this.write_bytes(b"\x1b[I");
             }
-            window.invalidate_character_coordinates();
-            cx.notify();
+            this.refresh_ime_context(window, cx);
         }));
         this._focus_out_sub =
             Some(
-                cx.on_focus_out(&this.focus_handle, window, |this, _event, _window, _cx| {
+                cx.on_focus_out(&this.focus_handle, window, |this, _event, window, cx| {
                     this.stop_input_method_listener();
+                    this.discard_ime_context(window, cx);
                     if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                         this.write_bytes(b"\x1b[O");
                     }
@@ -864,6 +867,36 @@ impl AgentTerminal {
         if self.convenience_state.refresh_input_mode() {
             cx.notify();
         }
+    }
+
+    pub(crate) fn restore_focus_and_ime_context(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        self.start_input_method_listener(cx);
+        self.refresh_ime_context(window, cx);
+    }
+
+    fn refresh_ime_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_marked_text = None;
+        input_method::sync_text_input_context_to_current_source(window, true);
+        window.invalidate_character_coordinates();
+        cx.notify();
+        cx.on_next_frame(window, |this, window, cx| {
+            this.refresh_convenience_state(cx);
+            input_method::sync_text_input_context_to_current_source(window, false);
+            window.invalidate_character_coordinates();
+            cx.notify();
+        });
+    }
+
+    fn discard_ime_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_marked_text = None;
+        input_method::discard_text_input_context_marked_text(window);
+        window.invalidate_character_coordinates();
+        cx.notify();
     }
 
     fn start_input_method_listener(&mut self, cx: &mut Context<Self>) {

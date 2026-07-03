@@ -260,6 +260,7 @@ impl Render for AgentTerminal {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up_left))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up_middle))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up_right))
+            .on_drag_move::<ExternalPaths>(cx.listener(Self::on_external_paths_drag_move))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))

@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::TermMode;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, InputHandler, KeyDownEvent,
-    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PromptLevel,
-    ScrollDelta, ScrollWheelEvent, UTF16Selection, Window, point, px, size,
+    App, Bounds, ClipboardItem, Context, DragMoveEvent, EntityInputHandler, InputHandler,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    PromptLevel, ScrollDelta, ScrollWheelEvent, UTF16Selection, Window, point, px, size,
 };
 use serde_json::json;
 
@@ -42,6 +42,38 @@ struct PasteRisk {
 pub(crate) struct AgentTerminalInputHandler {
     terminal: gpui::Entity<AgentTerminal>,
     element_bounds: Bounds<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExternalFileDragState {
+    active: bool,
+}
+
+impl ExternalFileDragState {
+    pub(crate) fn update_hover(&mut self, hovering_terminal: bool) {
+        self.active = hovering_terminal;
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.active = false;
+    }
+
+    fn should_suppress_mouse_move(&mut self, pressed_button: Option<MouseButton>) -> bool {
+        if !self.active {
+            return false;
+        }
+
+        if pressed_button == Some(MouseButton::Left) {
+            true
+        } else {
+            self.active = false;
+            false
+        }
+    }
+
+    fn should_suppress_mouse_up(&self, button: MouseButton) -> bool {
+        self.active && button == MouseButton::Left
+    }
 }
 
 macro_rules! define_mouse_forwarders {
@@ -423,6 +455,14 @@ impl AgentTerminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .external_file_drag
+            .should_suppress_mouse_move(event.pressed_button)
+        {
+            cx.stop_propagation();
+            return;
+        }
+
         if self.selection_mode_active {
             if event.pressed_button != self.selection_button {
                 return;
@@ -507,8 +547,22 @@ impl AgentTerminal {
         cx: &mut Context<Self>,
     ) {
         self.write_dropped_paths_input(paths);
+        self.external_file_drag.finish();
         cx.stop_propagation();
         cx.notify();
+    }
+
+    pub(crate) fn on_external_paths_drag_move(
+        &mut self,
+        event: &DragMoveEvent<gpui::ExternalPaths>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_file_drag
+            .update_hover(event.bounds.contains(&event.event.position));
+        if self.external_file_drag.active {
+            cx.stop_propagation();
+        }
     }
 
     pub(crate) fn link_at_position(
@@ -532,6 +586,7 @@ impl AgentTerminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.external_file_drag.finish();
         window.focus(&self.focus_handle, cx);
         self.last_mouse_report = None;
         self.trace_input(format!(
@@ -588,6 +643,10 @@ impl AgentTerminal {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.external_file_drag.should_suppress_mouse_up(event.button) {
+            return;
+        }
+
         if self.selection_mode_active && self.selection_button == Some(event.button) {
             let (row, col) = self.mouse_grid_point(event.position, window);
             self.update_selection_focus(row, col);
@@ -1692,7 +1751,7 @@ impl EntityInputHandler for AgentTerminal {
 
 #[cfg(test)]
 mod tests {
-    use gpui::px;
+    use gpui::{MouseButton, px};
     use std::path::PathBuf;
 
     use crate::render::terminal_content_padding_y;
@@ -1701,7 +1760,7 @@ mod tests {
     use super::{
         ax_text_matches_visible_input_context, dropped_paths_text, evaluate_paste_risk,
         extract_selection_text, normalize_selection_bounds, probable_ascii_prefix_noise,
-        selection_contains_cell, shell_escape_path,
+        selection_contains_cell, shell_escape_path, ExternalFileDragState,
     };
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
 
@@ -1863,6 +1922,28 @@ mod tests {
             PathBuf::from("/tmp/two's file.txt"),
         ]);
         assert_eq!(text, "'/tmp/one file.txt' '/tmp/two'\\''s file.txt'");
+    }
+
+    #[test]
+    fn external_file_drag_suppresses_terminal_mouse_until_drop_finishes() {
+        let mut drag = ExternalFileDragState::default();
+
+        drag.update_hover(true);
+        assert!(drag.should_suppress_mouse_move(Some(MouseButton::Left)));
+        assert!(drag.should_suppress_mouse_up(MouseButton::Left));
+
+        drag.finish();
+        assert!(!drag.should_suppress_mouse_move(Some(MouseButton::Left)));
+        assert!(!drag.should_suppress_mouse_up(MouseButton::Left));
+    }
+
+    #[test]
+    fn external_file_drag_clears_stale_state_on_plain_mouse_move() {
+        let mut drag = ExternalFileDragState::default();
+
+        drag.update_hover(true);
+        assert!(!drag.should_suppress_mouse_move(None));
+        assert!(!drag.should_suppress_mouse_move(Some(MouseButton::Left)));
     }
 
     fn cell(ch: char) -> CellSnapshot {

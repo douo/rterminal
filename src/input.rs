@@ -45,6 +45,35 @@ pub(crate) struct AgentTerminalInputHandler {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FocusActivationMouseGuard {
+    button: Option<MouseButton>,
+}
+
+impl FocusActivationMouseGuard {
+    fn should_suppress_mouse_down(&mut self, first_mouse: bool, button: MouseButton) -> bool {
+        if first_mouse && button == MouseButton::Left {
+            self.button = Some(button);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn should_suppress_mouse_move(&self, pressed_button: Option<MouseButton>) -> bool {
+        self.button.is_some() && pressed_button == self.button
+    }
+
+    fn should_suppress_mouse_up(&mut self, button: MouseButton) -> bool {
+        if self.button == Some(button) {
+            self.button = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ExternalFileDragState {
     active: bool,
 }
@@ -462,6 +491,13 @@ impl AgentTerminal {
             cx.stop_propagation();
             return;
         }
+        if self
+            .focus_activation_mouse
+            .should_suppress_mouse_move(event.pressed_button)
+        {
+            cx.stop_propagation();
+            return;
+        }
 
         if self.selection_mode_active {
             if event.pressed_button != self.selection_button {
@@ -590,13 +626,27 @@ impl AgentTerminal {
         self.restore_focus_and_ime_context(window, cx);
         self.last_mouse_report = None;
         self.trace_input(format!(
-            "mouse down button={:?} control={} shift={} alt={} platform={}",
+            "mouse down button={:?} first_mouse={} control={} shift={} alt={} platform={}",
             event.button,
+            event.first_mouse,
             event.modifiers.control,
             event.modifiers.shift,
             event.modifiers.alt,
             event.modifiers.platform
         ));
+
+        if self
+            .focus_activation_mouse
+            .should_suppress_mouse_down(event.first_mouse, event.button)
+        {
+            self.trace_input(format!(
+                "focus activation mouse suppressed button={:?}",
+                event.button
+            ));
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
 
         if event.button == MouseButton::Left
             && event.modifiers.platform
@@ -644,6 +694,18 @@ impl AgentTerminal {
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.external_file_drag.should_suppress_mouse_up(event.button) {
+            return;
+        }
+        if self
+            .focus_activation_mouse
+            .should_suppress_mouse_up(event.button)
+        {
+            self.trace_input(format!(
+                "focus activation mouse release suppressed button={:?}",
+                event.button
+            ));
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
 
@@ -1761,6 +1823,7 @@ mod tests {
         ax_text_matches_visible_input_context, dropped_paths_text, evaluate_paste_risk,
         extract_selection_text, normalize_selection_bounds, probable_ascii_prefix_noise,
         selection_contains_cell, shell_escape_path, ExternalFileDragState,
+        FocusActivationMouseGuard,
     };
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
 
@@ -1944,6 +2007,28 @@ mod tests {
         drag.update_hover(true);
         assert!(!drag.should_suppress_mouse_move(None));
         assert!(!drag.should_suppress_mouse_move(Some(MouseButton::Left)));
+    }
+
+    #[test]
+    fn focus_activation_mouse_guard_suppresses_first_left_click_sequence() {
+        let mut guard = FocusActivationMouseGuard::default();
+
+        assert!(guard.should_suppress_mouse_down(true, MouseButton::Left));
+        assert!(guard.should_suppress_mouse_move(Some(MouseButton::Left)));
+        assert!(!guard.should_suppress_mouse_move(Some(MouseButton::Right)));
+        assert!(guard.should_suppress_mouse_up(MouseButton::Left));
+        assert!(!guard.should_suppress_mouse_up(MouseButton::Left));
+    }
+
+    #[test]
+    fn focus_activation_mouse_guard_allows_regular_clicks() {
+        let mut guard = FocusActivationMouseGuard::default();
+
+        assert!(!guard.should_suppress_mouse_down(false, MouseButton::Left));
+        assert!(!guard.should_suppress_mouse_move(Some(MouseButton::Left)));
+        assert!(!guard.should_suppress_mouse_up(MouseButton::Left));
+        assert!(!guard.should_suppress_mouse_down(true, MouseButton::Right));
+        assert!(!guard.should_suppress_mouse_up(MouseButton::Right));
     }
 
     fn cell(ch: char) -> CellSnapshot {

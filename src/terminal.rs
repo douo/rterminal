@@ -32,7 +32,7 @@ use crate::convenience::{
 };
 use crate::debug_server::{SharedDebugState, start_debug_http_server};
 use crate::font_fallback::font_fallback_families;
-use crate::input::ExternalFileDragState;
+use crate::input::{ExternalFileDragState, FocusActivationMouseGuard};
 use crate::input_log::InputLogger;
 use crate::keyboard::encode_keystroke;
 use crate::pty::{PtySession, SharedPtyWriter, write_to_pty};
@@ -320,6 +320,7 @@ pub(crate) struct AgentTerminal {
     pub(crate) mouse_scroll_accum_x: f32,
     pub(crate) mouse_scroll_accum_y: f32,
     pub(crate) last_mouse_report: Option<(usize, usize, u8)>,
+    pub(crate) focus_activation_mouse: FocusActivationMouseGuard,
     pub(crate) external_file_drag: ExternalFileDragState,
     pub(crate) selection_mode_active: bool,
     pub(crate) selection_button: Option<gpui::MouseButton>,
@@ -501,6 +502,7 @@ impl AgentTerminal {
             mouse_scroll_accum_x: 0.0,
             mouse_scroll_accum_y: 0.0,
             last_mouse_report: None,
+            focus_activation_mouse: FocusActivationMouseGuard::default(),
             external_file_drag: ExternalFileDragState::default(),
             selection_mode_active: false,
             selection_button: None,

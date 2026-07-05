@@ -331,6 +331,7 @@ pub(crate) struct AgentTerminal {
     pub(crate) debug: SharedDebugState,
     pending_term_events: Arc<Mutex<Vec<PendingTerminalEvent>>>,
     pub(crate) _window_bounds_sub: Option<Subscription>,
+    pub(crate) _window_activation_sub: Option<Subscription>,
     pub(crate) _focus_in_sub: Option<Subscription>,
     pub(crate) _focus_out_sub: Option<Subscription>,
     pub(crate) input_method_watch_task: Option<Task<Result<()>>>,
@@ -511,6 +512,7 @@ impl AgentTerminal {
             debug,
             pending_term_events,
             _window_bounds_sub: None,
+            _window_activation_sub: None,
             _focus_in_sub: None,
             _focus_out_sub: None,
             input_method_watch_task: None,
@@ -520,6 +522,9 @@ impl AgentTerminal {
         this.refresh_snapshot();
         this._window_bounds_sub = Some(cx.observe_window_bounds(window, |this, window, cx| {
             this.sync_grid_to_window(window);
+            cx.notify();
+        }));
+        this._window_activation_sub = Some(cx.observe_window_activation(window, |_, _, cx| {
             cx.notify();
         }));
         this._focus_in_sub = Some(cx.on_focus(&this.focus_handle, window, |this, window, cx| {

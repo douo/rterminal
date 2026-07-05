@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use crate::cli::Theme;
-use crate::convenience::cursor_indicator::cursor_color_for_input_mode;
+use crate::convenience::cursor_indicator::cursor_color_for_focus;
 use crate::input::selection_contains_cell;
 use crate::{AgentTerminal, AgentTerminalInputHandler};
 
@@ -217,6 +217,7 @@ impl Render for AgentTerminal {
             });
         }
         let focused = self.focus_handle.is_focused(window);
+        let window_active = window.is_window_active();
         let focus_handle = self.focus_handle.clone();
         let entity = cx.entity();
         let status = self.debug.status_summary();
@@ -232,7 +233,7 @@ impl Render for AgentTerminal {
         }
         let input_mode = self.convenience_state.input_mode();
         let palette = palette_for(self.theme);
-        let cursor_bg = cursor_color_for_input_mode(palette.cursor_bg, input_mode);
+        let cursor_bg = cursor_color_for_focus(palette.cursor_bg, input_mode, window_active);
         let terminal_title = self
             .terminal_title
             .lock()
@@ -496,7 +497,7 @@ impl Render for AgentTerminal {
                             );
                         }
 
-                        if focused && snapshot.cursor_visible && ime_marked_text.is_none() {
+                        if snapshot.cursor_visible && ime_marked_text.is_none() {
                             let cursor_logical_col_floor =
                                 cursor_visual_col.max(0.0).floor() as usize;
                             let cursor_extra_cols = snapshot

@@ -98,16 +98,16 @@ fn encode_special_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
     // key_char as a transformed glyph (e.g. Option+W -> ∑). For terminal
     // Meta bindings we want the physical printable key instead.
     if modifiers.alt && !modifiers.control {
-        if key.chars().count() == 1 && key.is_ascii() {
-            if keystroke
+        if key.chars().count() == 1
+            && key.is_ascii()
+            && keystroke
                 .key_char
                 .as_ref()
                 .is_some_and(|value| !value.is_empty() && !value.is_ascii())
-            {
-                let mut bytes = vec![0x1b];
-                bytes.extend_from_slice(key.as_bytes());
-                return Some(bytes);
-            }
+        {
+            let mut bytes = vec![0x1b];
+            bytes.extend_from_slice(key.as_bytes());
+            return Some(bytes);
         }
 
         if let Some(key_char) = keystroke
@@ -191,12 +191,13 @@ fn should_disambiguate_as_csi_u(keystroke: &gpui::Keystroke) -> bool {
         return true;
     }
 
+    // Shift alone is deliberately excluded: Shift+Tab has an unambiguous legacy
+    // encoding (CSI Z), so disambiguate mode has no reason to promote it to CSI-u.
     if matches!(key, "tab" | "enter" | "backspace") {
-        return modifiers.control || modifiers.alt || (modifiers.shift && modifiers.alt);
+        return modifiers.control || modifiers.alt;
     }
 
-    (modifiers.alt || modifiers.control || (modifiers.shift && modifiers.alt))
-        && kitty_key_code(keystroke).is_some()
+    (modifiers.alt || modifiers.control) && kitty_key_code(keystroke).is_some()
 }
 
 fn encode_kitty_csi_u(

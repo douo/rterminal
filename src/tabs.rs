@@ -397,7 +397,9 @@ impl Render for TerminalTabs {
             })
             .collect();
         let active_content = self.tabs.get(self.active_tab).map(|tab| match &tab.kind {
-            TerminalTabKind::Terminal { terminal, .. } => ActiveTabContent::Terminal(terminal.clone()),
+            TerminalTabKind::Terminal { terminal, .. } => {
+                ActiveTabContent::Terminal(terminal.clone())
+            }
             TerminalTabKind::Snapshot { snapshot } => ActiveTabContent::Snapshot(snapshot.clone()),
         });
 
@@ -565,7 +567,10 @@ mod tests {
 
     #[test]
     fn truncate_tab_title_adds_ellipsis_for_long_title() {
-        assert_eq!(truncate_tab_title("abcdefghijklmnopqrstuvwxyz", 10), "abcdefg...");
+        assert_eq!(
+            truncate_tab_title("abcdefghijklmnopqrstuvwxyz", 10),
+            "abcdefg..."
+        );
     }
 
     #[test]

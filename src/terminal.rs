@@ -170,10 +170,12 @@ impl EventListener for TitleTrackingListener {
                 region_top,
                 region_bottom,
             } => {
-                self.pending_events.lock().push(PendingTerminalEvent::Erase {
-                    region_top,
-                    region_bottom,
-                });
+                self.pending_events
+                    .lock()
+                    .push(PendingTerminalEvent::Erase {
+                        region_top,
+                        region_bottom,
+                    });
             }
             _ => {}
         }
@@ -1448,8 +1450,8 @@ fn annotate_plain_text_links_for_row(row: &mut [CellSnapshot]) {
     }
 
     for (start, end, uri) in find_plain_text_links(&text) {
-        for text_col in start..end.min(char_cols.len()) {
-            let cell_col = char_cols[text_col];
+        let end = end.min(char_cols.len());
+        for &cell_col in &char_cols[start.min(end)..end] {
             if row[cell_col].link.is_none() {
                 row[cell_col].link = Some(uri.clone());
             }
@@ -1553,6 +1555,91 @@ fn parse_double_width_chars(raw: &[String]) -> HashSet<char> {
         .flat_map(|entry| entry.chars())
         .filter(|ch| !ch.is_whitespace())
         .collect()
+}
+
+pub(crate) fn run_self_check() -> Result<()> {
+    let enter = gpui::Keystroke::parse("enter").context("parse enter")?;
+    ensure!(
+        encode_keystroke(&enter) == Some(vec![b'\r']),
+        "enter keystroke encoding mismatch"
+    );
+
+    let alt_x = gpui::Keystroke::parse("alt-x").context("parse alt-x")?;
+    ensure!(
+        encode_keystroke(&alt_x) == Some(vec![0x1b, b'x']),
+        "alt-x keystroke encoding mismatch"
+    );
+
+    let ctrl_c = gpui::Keystroke::parse("ctrl-c").context("parse ctrl-c")?;
+    ensure!(
+        encode_keystroke(&ctrl_c) == Some(vec![3]),
+        "ctrl-c keystroke encoding mismatch"
+    );
+
+    let chinese = gpui::Keystroke {
+        modifiers: gpui::Modifiers::none(),
+        key: "x".to_string(),
+        key_char: Some("你".to_string()),
+    };
+    ensure!(
+        encode_keystroke(&chinese) == Some("你".as_bytes().to_vec()),
+        "chinese ime keystroke encoding mismatch"
+    );
+
+    let ime_in_progress = gpui::Keystroke {
+        modifiers: gpui::Modifiers::none(),
+        key: "a".to_string(),
+        key_char: None,
+    };
+    ensure!(
+        encode_keystroke(&ime_in_progress).is_none(),
+        "ime in-progress keystroke should not emit bytes"
+    );
+
+    let cmd_v = gpui::Keystroke {
+        modifiers: gpui::Modifiers {
+            platform: true,
+            ..gpui::Modifiers::none()
+        },
+        key: "v".to_string(),
+        key_char: Some("v".to_string()),
+    };
+    ensure!(
+        encode_keystroke(&cmd_v).is_none(),
+        "cmd-v should not be forwarded as raw character"
+    );
+
+    let default_colors = alacritty_terminal::term::color::Colors::default();
+    ensure!(
+        indexed_to_rgb(16, &default_colors) == (0, 0, 0),
+        "indexed color 16 mismatch"
+    );
+    ensure!(
+        indexed_to_rgb(231, &default_colors) == (255, 255, 255),
+        "indexed color 231 mismatch"
+    );
+
+    let grid = compute_grid_size(
+        gpui::size(gpui::px(1000.0), gpui::px(520.0)),
+        gpui::px(8.0),
+        line_height_for(DEFAULT_FONT_SIZE),
+        false,
+    );
+    ensure!(
+        grid.cols >= 80,
+        "computed columns too small for 1000px viewport"
+    );
+    ensure!(
+        grid.rows >= 20,
+        "computed rows too small for 520px viewport"
+    );
+
+    println!(
+        "self-check passed: keyboard/color/grid invariants OK (cols={}, rows={})",
+        grid.cols, grid.rows
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1867,7 +1954,7 @@ mod tests {
         let fallback_list = fallbacks.fallback_list();
 
         assert_eq!(
-            fallback_list.get(0).map(String::as_str),
+            fallback_list.first().map(String::as_str),
             Some("Custom Symbols")
         );
         assert_eq!(
@@ -1882,89 +1969,4 @@ mod tests {
             1
         );
     }
-}
-
-pub(crate) fn run_self_check() -> Result<()> {
-    let enter = gpui::Keystroke::parse("enter").context("parse enter")?;
-    ensure!(
-        encode_keystroke(&enter) == Some(vec![b'\r']),
-        "enter keystroke encoding mismatch"
-    );
-
-    let alt_x = gpui::Keystroke::parse("alt-x").context("parse alt-x")?;
-    ensure!(
-        encode_keystroke(&alt_x) == Some(vec![0x1b, b'x']),
-        "alt-x keystroke encoding mismatch"
-    );
-
-    let ctrl_c = gpui::Keystroke::parse("ctrl-c").context("parse ctrl-c")?;
-    ensure!(
-        encode_keystroke(&ctrl_c) == Some(vec![3]),
-        "ctrl-c keystroke encoding mismatch"
-    );
-
-    let chinese = gpui::Keystroke {
-        modifiers: gpui::Modifiers::none(),
-        key: "x".to_string(),
-        key_char: Some("你".to_string()),
-    };
-    ensure!(
-        encode_keystroke(&chinese) == Some("你".as_bytes().to_vec()),
-        "chinese ime keystroke encoding mismatch"
-    );
-
-    let ime_in_progress = gpui::Keystroke {
-        modifiers: gpui::Modifiers::none(),
-        key: "a".to_string(),
-        key_char: None,
-    };
-    ensure!(
-        encode_keystroke(&ime_in_progress).is_none(),
-        "ime in-progress keystroke should not emit bytes"
-    );
-
-    let cmd_v = gpui::Keystroke {
-        modifiers: gpui::Modifiers {
-            platform: true,
-            ..gpui::Modifiers::none()
-        },
-        key: "v".to_string(),
-        key_char: Some("v".to_string()),
-    };
-    ensure!(
-        encode_keystroke(&cmd_v).is_none(),
-        "cmd-v should not be forwarded as raw character"
-    );
-
-    let default_colors = alacritty_terminal::term::color::Colors::default();
-    ensure!(
-        indexed_to_rgb(16, &default_colors) == (0, 0, 0),
-        "indexed color 16 mismatch"
-    );
-    ensure!(
-        indexed_to_rgb(231, &default_colors) == (255, 255, 255),
-        "indexed color 231 mismatch"
-    );
-
-    let grid = compute_grid_size(
-        gpui::size(gpui::px(1000.0), gpui::px(520.0)),
-        gpui::px(8.0),
-        line_height_for(DEFAULT_FONT_SIZE),
-        false,
-    );
-    ensure!(
-        grid.cols >= 80,
-        "computed columns too small for 1000px viewport"
-    );
-    ensure!(
-        grid.rows >= 20,
-        "computed rows too small for 520px viewport"
-    );
-
-    println!(
-        "self-check passed: keyboard/color/grid invariants OK (cols={}, rows={})",
-        grid.cols, grid.rows
-    );
-
-    Ok(())
 }

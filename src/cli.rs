@@ -36,7 +36,10 @@ pub(crate) struct CliOptions {
     pub(crate) input_log_raw: bool,
     #[arg(long, help = "Disable smooth cursor slide animation")]
     pub(crate) no_cursor_slide: bool,
-    #[arg(long, help = "Force a vertical beam cursor regardless of app cursor mode")]
+    #[arg(
+        long,
+        help = "Force a vertical beam cursor regardless of app cursor mode"
+    )]
     pub(crate) force_vertical_cursor: bool,
     #[arg(long, help = "Enable subtle trailing effect for vertical beam cursor")]
     pub(crate) cursor_trail: bool,

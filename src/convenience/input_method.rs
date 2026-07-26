@@ -305,9 +305,8 @@ mod platform {
             return None;
         }
 
-        let source_id =
-            unsafe { input_source_string_property(source, kTISPropertyInputSourceID) }
-                .unwrap_or_default();
+        let source_id = unsafe { input_source_string_property(source, kTISPropertyInputSourceID) }
+            .unwrap_or_default();
         let mode_id = unsafe { input_source_string_property(source, kTISPropertyInputModeID) }
             .unwrap_or_default();
         let languages = unsafe { input_source_languages(source) };

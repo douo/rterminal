@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # 必须是 macOS：项目依赖 gpui_macos / cocoa / CoreText，且 CJK fallback 补丁是 macOS 专属。
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 已固定 channel 1.95.0 与 clippy/rustfmt 组件，
+      # 所以这里不指定版本，让 rustup 读文件，避免两处版本漂移。
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 必须在 build 之前：补丁打在 cargo git checkout 里，需要依赖先被 fetch 出来。
+      # 不打补丁编译依然会通过，只是中文渲染静默退化，所以这一步是硬门槛。
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      - name: Apply vendored dependency patches
+        run: scripts/apply-vendor-patches.sh
+
+      - name: Verify patches are applied
+        run: scripts/apply-vendor-patches.sh --check
+
+      - name: Format check (agent_terminal only)
+        run: cargo fmt -p agent_terminal -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (whole workspace)
+        run: cargo test --workspace
+
+      - name: Self check
+        run: cargo run --quiet -- --self-check

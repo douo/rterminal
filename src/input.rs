@@ -693,7 +693,10 @@ impl AgentTerminal {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.external_file_drag.should_suppress_mouse_up(event.button) {
+        if self
+            .external_file_drag
+            .should_suppress_mouse_up(event.button)
+        {
             return;
         }
         if self
@@ -1820,10 +1823,10 @@ mod tests {
     use crate::terminal::CellSnapshot;
 
     use super::{
-        ax_text_matches_visible_input_context, dropped_paths_text, evaluate_paste_risk,
-        extract_selection_text, normalize_selection_bounds, probable_ascii_prefix_noise,
-        selection_contains_cell, shell_escape_path, ExternalFileDragState,
-        FocusActivationMouseGuard,
+        ExternalFileDragState, FocusActivationMouseGuard, ax_text_matches_visible_input_context,
+        dropped_paths_text, evaluate_paste_risk, extract_selection_text,
+        normalize_selection_bounds, probable_ascii_prefix_noise, selection_contains_cell,
+        shell_escape_path,
     };
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
 

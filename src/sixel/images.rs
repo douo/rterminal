@@ -184,7 +184,11 @@ fn scroll_images_in_region(
         .collect();
 }
 
-fn erase_images_in_region(images: &mut Vec<TerminalImage>, region_top: usize, region_bottom: usize) {
+fn erase_images_in_region(
+    images: &mut Vec<TerminalImage>,
+    region_top: usize,
+    region_bottom: usize,
+) {
     if region_top >= region_bottom {
         return;
     }
@@ -227,7 +231,11 @@ mod tests {
 
     #[test]
     fn sixel_layout_reservation_places_following_text_below_image() {
-        let mut term = Term::new(Config::default(), &GridSize { cols: 80, rows: 6 }, NoopListener);
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize { cols: 80, rows: 6 },
+            NoopListener,
+        );
         let mut processor = Processor::<StdSyncHandler>::new();
         let mut parser = SixelStreamParser::default();
         let actions = parser.advance(b"before\r\n\x1bPq\"1;1;1;36#1~\x1b\\after");
@@ -261,7 +269,11 @@ mod tests {
 
     #[test]
     fn sixel_layout_reservation_reports_scroll_when_image_starts_at_bottom() {
-        let mut term = Term::new(Config::default(), &GridSize { cols: 80, rows: 4 }, NoopListener);
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize { cols: 80, rows: 4 },
+            NoopListener,
+        );
         let mut processor = Processor::<StdSyncHandler>::new();
 
         processor.advance(&mut term, b"\x1b[4;1H");
@@ -277,7 +289,11 @@ mod tests {
 
     #[test]
     fn sixel_images_follow_normal_text_scrollback() {
-        let mut term = Term::new(Config::default(), &GridSize { cols: 80, rows: 4 }, NoopListener);
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize { cols: 80, rows: 4 },
+            NoopListener,
+        );
         let mut processor = Processor::<StdSyncHandler>::new();
         let mut images = vec![TerminalImage {
             row: 2,

@@ -89,7 +89,7 @@ impl SixelDecoder {
                 }
                 b'!' => {
                     let (count, next) = parse_number(bytes, i + 1);
-                    repeat = count.unwrap_or(1).max(1).min(MAX_SIXEL_DIMENSION);
+                    repeat = count.unwrap_or(1).clamp(1, MAX_SIXEL_DIMENSION);
                     i = next;
                 }
                 b'"' => {
@@ -357,12 +357,11 @@ fn default_palette() -> [[u8; 4]; 256] {
     ];
     palette[..ansi.len()].copy_from_slice(&ansi);
 
-    for index in 16..232 {
-        let value = index - 16;
+    for (value, slot) in palette[16..232].iter_mut().enumerate() {
         let r = value / 36;
         let g = (value / 6) % 6;
         let b = value % 6;
-        palette[index] = [cube_component(r), cube_component(g), cube_component(b), 0xff];
+        *slot = [cube_component(r), cube_component(g), cube_component(b), 0xff];
     }
 
     for (offset, index) in (232..256).enumerate() {

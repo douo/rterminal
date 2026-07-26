@@ -1,6 +1,6 @@
 use std::io::Write;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tiny_http::{Header, Response, Server, StatusCode};
 
-use crate::pty::write_to_pty;
 use crate::GridSize;
+use crate::pty::write_to_pty;
 
 const DEBUG_HTTP_DEFAULT_HOST: &str = "127.0.0.1";
 const DEBUG_HTTP_DEFAULT_PORT_START: u16 = 37878;
@@ -236,11 +236,10 @@ fn next_default_debug_http_addr() -> String {
     let port = NEXT_DEBUG_HTTP_PORT
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(
-                if current >= DEBUG_HTTP_DEFAULT_PORT_END || current < DEBUG_HTTP_DEFAULT_PORT_START
-                {
-                    DEBUG_HTTP_DEFAULT_PORT_START
-                } else {
+                if (DEBUG_HTTP_DEFAULT_PORT_START..DEBUG_HTTP_DEFAULT_PORT_END).contains(&current) {
                     current + 1
+                } else {
+                    DEBUG_HTTP_DEFAULT_PORT_START
                 },
             )
         })

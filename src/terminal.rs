@@ -561,7 +561,7 @@ impl AgentTerminal {
             Some(
                 cx.on_focus_out(&this.focus_handle, window, |this, _event, window, cx| {
                     this.stop_input_method_listener();
-                    this.discard_ime_context(window, cx);
+                    this.flush_ime_context(window, cx);
                     if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                         this.write_bytes(b"\x1b[O");
                     }
@@ -907,7 +907,11 @@ impl AgentTerminal {
     }
 
     fn refresh_ime_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ime_marked_text = None;
+        // 提交而不是丢弃：这条路径也覆盖"组合中点击终端"（on_mouse_down →
+        // restore_focus_and_ime_context），而 macOS 的惯例（Terminal.app / TextEdit）
+        // 是点击时提交已敲的内容。下面的 sync(…, true) 会 discardMarkedText，
+        // 所以平台侧不会再重复提交一次。
+        self.commit_ime_marked_text();
         input_method::sync_text_input_context_to_current_source(window, true);
         window.invalidate_character_coordinates();
         cx.notify();
@@ -919,8 +923,12 @@ impl AgentTerminal {
         });
     }
 
-    fn discard_ime_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ime_marked_text = None;
+    /// 失焦时收尾 IME：先提交悬挂的组合文本，再让平台丢掉它的组合状态。
+    ///
+    /// 命名上曾经叫 discard，行为也真的是丢弃——但失焦丢掉用户已敲的一段拼音是数据
+    /// 丢失，macOS 的文本控件在失焦时是提交的。
+    fn flush_ime_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_ime_marked_text();
         input_method::discard_text_input_context_marked_text(window);
         window.invalidate_character_coordinates();
         cx.notify();

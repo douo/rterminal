@@ -238,6 +238,62 @@ impl InputHandler for AgentTerminalInputHandler {
 }
 
 impl AgentTerminal {
+    /// 把悬挂的 IME 组合文本按"正常文本"提交掉，返回是否真的提交了内容。
+    ///
+    /// NSTextInputClient 对 `unmarkText` 的规定就是"把 marked text 作为正常文本插入"，
+    /// 而此前**所有**中断路径（unmarkText、失焦、点击、粘贴、拖放）都是直接扔掉——
+    /// 用户已经敲进去的一整段拼音/汉字静默消失，属数据丢失。
+    ///
+    /// 只动模型和 PTY。平台侧的组合状态要由调用方接着 discard（`discardMarkedText`），
+    /// 否则输入法之后可能把同一段内容再 insertText 一次，变成双重输入。
+    ///
+    /// 另有两处**故意**直接丢弃而不走这里，别顺手改掉：
+    /// - `replace_text_in_range`：那是输入法在提交最终文本，它自带 `text` 参数，
+    ///   再提交一次 marked text 就是双重插入。
+    /// - `apply_external_ax_input_state`：外部工具整行替换输入行，提交 marked text
+    ///   会先往 PTY 写一段随后又被模型覆盖掉的内容，直接把两者搞不一致。
+    pub(crate) fn commit_ime_marked_text(&mut self) -> bool {
+        let Some(text) = self.ime_marked_text.take().filter(|text| !text.is_empty()) else {
+            return false;
+        };
+
+        self.trace_input(format!(
+            "ime commit marked text len={} value={}",
+            text.len(),
+            summarize_text_for_trace(&text)
+        ));
+        self.log_input_event(
+            "ime_commit_marked_text",
+            json!({
+                "text": self.input_log_text_value(&text),
+                "before_line": self.input_log_text_value(&self.input_line),
+                "before_cursor_utf16": self.input_cursor_utf16,
+            }),
+        );
+
+        self.insert_input_text_at_cursor(&text);
+        self.write_text_input(&text);
+        true
+    }
+
+    /// 在插入"外部来源的文本"（粘贴、文件拖放）之前收尾 IME 组合。
+    ///
+    /// 提交模型侧内容 + 让平台丢掉组合状态，两者必须成对，否则输入法之后会把同一段
+    /// 内容再 insertText 一次。
+    pub(crate) fn commit_marked_text_before_external_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.commit_ime_marked_text() {
+            return;
+        }
+
+        crate::convenience::input_method::discard_text_input_context_marked_text(window);
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
     pub(crate) fn write_text_input(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -579,9 +635,11 @@ impl AgentTerminal {
     pub(crate) fn on_external_paths_drop(
         &mut self,
         paths: &gpui::ExternalPaths,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 与粘贴同理：组合中拖入文件，先把 marked text 收尾再插入路径。
+        self.commit_marked_text_before_external_input(window, cx);
         self.write_dropped_paths_input(paths);
         self.external_file_drag.finish();
         cx.stop_propagation();
@@ -923,6 +981,13 @@ impl AgentTerminal {
         if is_paste_shortcut(&event.keystroke) {
             self.mark_local_key_activity();
             self.debug.record_key_event();
+            // 组合进行中粘贴：先把 marked text 收尾。不然渲染层还在光标处画组合串、
+            // 真实光标被隐藏，而粘贴内容已经写进 PTY，提交后文本顺序与用户所见错乱，
+            // 影子模型的插入点也和实际字节序不一致。
+            //
+            // 放在这里而不是 write_paste_input 里，是因为大粘贴确认走的是异步分支
+            // （spawn 之后拿不到 window），而平台侧的 discardMarkedText 需要 window。
+            self.commit_marked_text_before_external_input(window, cx);
             if let Some(item) = cx.read_from_clipboard()
                 && let Some(text) = item.text()
             {
@@ -1160,6 +1225,8 @@ impl AgentTerminal {
 
         self.input_line = state.text;
         self.input_cursor_utf16 = cursor_utf16;
+        // 这里**必须**丢弃而不是提交：外部工具是整行替换，提交会先往 PTY 写一段
+        // 随后又被上面这行覆盖掉的文本，让 PTY 与模型直接分叉。
         self.ime_marked_text = None;
         self.rewrite_terminal_input_line();
         self.log_input_event(
@@ -1721,8 +1788,11 @@ impl EntityInputHandler for AgentTerminal {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ime_marked_text = None;
-        self.trace_input("ime unmark_text");
+        // NSTextInputClient 规定 unmarkText 要"把 marked text 作为正常文本插入"，
+        // 不是丢弃。某些输入法（以及切换输入源、系统强制结束组合）走的正是这条路
+        // 收尾——此前那一整段拼音会静默消失。
+        let committed = self.commit_ime_marked_text();
+        self.trace_input(format!("ime unmark_text committed={committed}"));
         window.invalidate_character_coordinates();
         cx.notify();
     }
@@ -1734,6 +1804,8 @@ impl EntityInputHandler for AgentTerminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 这里**必须**丢弃而不是提交：输入法正在提交最终文本，它就在下面的 `text`
+        // 参数里，再提交一次 marked text 会变成双重插入。
         self.ime_marked_text = None;
         self.trace_input(format!(
             "ime replace_text_in_range len={} text={}",

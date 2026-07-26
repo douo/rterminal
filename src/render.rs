@@ -7,7 +7,7 @@ use gpui::{
 
 use crate::cli::Theme;
 use crate::convenience::cursor_indicator::cursor_color_for_focus;
-use crate::input::selection_contains_cell;
+use crate::grid_cells::{cell_advance_cols, selection_contains_cell, visual_extra_cols_before};
 use crate::{AgentTerminal, AgentTerminalInputHandler};
 
 pub(crate) const LINE_HEIGHT_SCALE: f32 = 18.0 / 14.0;
@@ -37,36 +37,13 @@ pub(crate) fn measure_cell_width(
         .unwrap_or(px(8.0))
 }
 
-fn build_terminal_font(font_family: &str, font_fallbacks: Option<&FontFallbacks>) -> Font {
+pub(crate) fn build_terminal_font(
+    font_family: &str,
+    font_fallbacks: Option<&FontFallbacks>,
+) -> Font {
     let mut mono = font(font_family.to_string());
     mono.fallbacks = font_fallbacks.cloned();
     mono
-}
-
-fn cell_advance_cols(cell: &crate::terminal::CellSnapshot) -> usize {
-    if cell.spans_next_col {
-        usize::from(cell.width_cols.max(1))
-    } else {
-        1
-    }
-}
-
-fn visual_extra_cols_before(row: &[crate::terminal::CellSnapshot], logical_col: usize) -> f32 {
-    let mut covered_until_col = 0usize;
-    let mut extra_cols = 0f32;
-    for (col_index, cell) in row.iter().enumerate() {
-        if col_index >= logical_col {
-            break;
-        }
-        if col_index < covered_until_col {
-            continue;
-        }
-        if cell.expands_layout && cell.width_cols > 1 {
-            extra_cols += f32::from(cell.width_cols - 1);
-        }
-        covered_until_col = col_index.saturating_add(cell_advance_cols(cell));
-    }
-    extra_cols
 }
 
 fn link_hover_bounds(
@@ -146,20 +123,20 @@ pub(crate) fn terminal_content_padding_y(
 }
 
 #[derive(Clone, Copy)]
-struct RenderPalette {
-    app_bg: Hsla,
-    terminal_bg: Hsla,
-    title_bg: Hsla,
-    title_fg: Hsla,
-    selection_bg: Hsla,
-    cursor_bg: Hsla,
+pub(crate) struct RenderPalette {
+    pub(crate) app_bg: Hsla,
+    pub(crate) terminal_bg: Hsla,
+    pub(crate) title_bg: Hsla,
+    pub(crate) title_fg: Hsla,
+    pub(crate) selection_bg: Hsla,
+    pub(crate) cursor_bg: Hsla,
 }
 
 struct TerminalCanvasPrepaint {
     link_hover_hitbox: Option<Hitbox>,
 }
 
-fn palette_for(theme: Theme) -> RenderPalette {
+pub(crate) fn palette_for(theme: Theme) -> RenderPalette {
     match theme {
         Theme::Default => RenderPalette {
             app_bg: rgb(0x0f1115).into(),

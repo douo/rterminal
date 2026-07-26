@@ -5,6 +5,7 @@ mod color;
 mod convenience;
 mod debug_server;
 mod font_fallback;
+mod grid_cells;
 mod input;
 mod input_log;
 mod keyboard;

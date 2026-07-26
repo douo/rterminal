@@ -11,6 +11,10 @@ use gpui::{
 use serde_json::json;
 
 use crate::AgentTerminal;
+use crate::grid_cells::{
+    cell_advance_cols, extract_selection_text, normalize_selection_bounds, normalize_selection_col,
+    row_text_without_wide_spacers,
+};
 use crate::keyboard::{
     KittyKeyEventType, encode_keystroke_with_mode, is_paste_shortcut, is_select_all_shortcut,
     is_zoom_in_shortcut, is_zoom_out_shortcut, should_defer_to_text_input,
@@ -20,7 +24,7 @@ use crate::render::{
     CUSTOM_TITLE_BAR_HEIGHT, STATUS_BAR_HEIGHT, TEXT_PADDING_X, measure_cell_width,
     terminal_content_padding_y,
 };
-use crate::terminal::{CellSnapshot, ScreenSnapshot, SelectionPoint};
+use crate::terminal::SelectionPoint;
 use crate::text_utils::{
     delete_next_word_utf16, delete_previous_word_utf16, delete_to_end_utf16,
     summarize_text_for_trace, utf16_substring, utf16_to_byte_index,
@@ -1292,7 +1296,7 @@ impl AgentTerminal {
 
     fn current_selection_text(&self) -> Option<String> {
         let (start, end) = self.selection_bounds()?;
-        let text = extract_selection_text(&self.snapshot, start, end);
+        let text = extract_selection_text(&self.snapshot.cells, start, end);
         if text.is_empty() { None } else { Some(text) }
     }
 
@@ -1597,133 +1601,6 @@ fn shell_escape_path(path: &Path) -> String {
     escaped
 }
 
-fn normalize_selection_bounds(
-    start: SelectionPoint,
-    end: SelectionPoint,
-) -> (SelectionPoint, SelectionPoint) {
-    if (start.row, start.col) <= (end.row, end.col) {
-        (start, end)
-    } else {
-        (end, start)
-    }
-}
-
-pub(crate) fn selection_contains_cell(
-    start: SelectionPoint,
-    end: SelectionPoint,
-    row: usize,
-    col: usize,
-) -> bool {
-    if row < start.row || row > end.row {
-        return false;
-    }
-
-    if start.row == end.row {
-        return row == start.row && col >= start.col && col <= end.col;
-    }
-
-    if row == start.row {
-        return col >= start.col;
-    }
-
-    if row == end.row {
-        return col <= end.col;
-    }
-
-    true
-}
-
-fn extract_selection_text(
-    snapshot: &ScreenSnapshot,
-    start: SelectionPoint,
-    end: SelectionPoint,
-) -> String {
-    let mut lines = Vec::new();
-
-    for row in start.row..=end.row {
-        let Some(cells) = snapshot.cells.get(row) else {
-            break;
-        };
-        if cells.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-
-        let line_start = if row == start.row {
-            normalize_selection_col(cells, start.col)
-        } else {
-            0
-        };
-        let line_end = if row == end.row {
-            normalize_selection_col(cells, end.col)
-        } else {
-            cells.len().saturating_sub(1)
-        };
-        if line_start >= cells.len() {
-            lines.push(String::new());
-            continue;
-        }
-
-        let clamped_end = line_end.min(cells.len().saturating_sub(1));
-        if line_start > clamped_end {
-            lines.push(String::new());
-            continue;
-        }
-
-        let mut text = String::new();
-        let mut col = line_start;
-        while col <= clamped_end {
-            let cell = &cells[col];
-            cell.push_text_to(&mut text);
-            let step = cell_advance_cols(cell);
-            col = col.saturating_add(step);
-        }
-        let trimmed_len = text.trim_end().len();
-        text.truncate(trimmed_len);
-        lines.push(text);
-    }
-
-    lines.join("\n")
-}
-
-fn normalize_selection_col(cells: &[CellSnapshot], col: usize) -> usize {
-    if cells.is_empty() {
-        return 0;
-    }
-
-    let mut normalized = col.min(cells.len().saturating_sub(1));
-    while normalized > 0 {
-        let prev = normalized - 1;
-        let prev_span = cell_advance_cols(&cells[prev]);
-        if prev_span > 1 && prev.saturating_add(prev_span) > normalized {
-            normalized = prev;
-            continue;
-        }
-        break;
-    }
-
-    normalized
-}
-
-fn row_text_without_wide_spacers(cells: &[CellSnapshot]) -> String {
-    let mut text = String::new();
-    let mut col = 0usize;
-    while col < cells.len() {
-        let cell = &cells[col];
-        cell.push_text_to(&mut text);
-        col = col.saturating_add(cell_advance_cols(cell));
-    }
-    text
-}
-
-fn cell_advance_cols(cell: &CellSnapshot) -> usize {
-    if cell.spans_next_col {
-        usize::from(cell.width_cols.max(1))
-    } else {
-        1
-    }
-}
-
 fn probable_ascii_prefix_noise(ax_text: &str, model_text: &str) -> bool {
     if model_text.is_empty() {
         return false;
@@ -1926,15 +1803,12 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::render::terminal_content_padding_y;
-    use crate::terminal::CellSnapshot;
 
     use super::{
         ExternalFileDragState, FocusActivationMouseGuard, ax_text_matches_visible_input_context,
-        dropped_paths_text, encode_mouse_report, evaluate_paste_risk, extract_selection_text,
-        normalize_selection_bounds, probable_ascii_prefix_noise, selection_contains_cell,
+        dropped_paths_text, encode_mouse_report, evaluate_paste_risk, probable_ascii_prefix_noise,
         shell_escape_path,
     };
-    use crate::terminal::{ScreenSnapshot, SelectionPoint};
     use alacritty_terminal::term::TermMode;
 
     /// 回归（SEC-7）：三个条件原本是**与**关系，于是最典型的危险粘贴——纯 ASCII 的
@@ -1968,99 +1842,6 @@ mod tests {
         let risk = evaluate_paste_risk(&opaque).expect("bulky non-ascii paste must be confirmed");
         assert_eq!(risk.line_count, 1);
         assert!(risk.non_ascii_ratio > 0.9);
-    }
-
-    #[test]
-    fn selection_bounds_are_normalized() {
-        let a = SelectionPoint { row: 4, col: 10 };
-        let b = SelectionPoint { row: 1, col: 2 };
-        let (start, end) = normalize_selection_bounds(a, b);
-        assert_eq!(start, b);
-        assert_eq!(end, a);
-    }
-
-    #[test]
-    fn selection_contains_handles_single_and_multi_line_ranges() {
-        let start = SelectionPoint { row: 1, col: 3 };
-        let end = SelectionPoint { row: 3, col: 2 };
-
-        assert!(selection_contains_cell(start, end, 1, 3));
-        assert!(selection_contains_cell(start, end, 2, 50));
-        assert!(selection_contains_cell(start, end, 3, 2));
-        assert!(!selection_contains_cell(start, end, 0, 10));
-        assert!(!selection_contains_cell(start, end, 1, 2));
-        assert!(!selection_contains_cell(start, end, 3, 3));
-    }
-
-    #[test]
-    fn extract_selection_text_returns_expected_multiline_slice() {
-        let snapshot = ScreenSnapshot {
-            cells: vec![
-                "012345".chars().map(cell).collect(),
-                "abcdef".chars().map(cell).collect(),
-                "uvwxyz".chars().map(cell).collect(),
-            ],
-            cursor_row: 0,
-            cursor_col: 0,
-            cursor_visible: true,
-            alt_screen: false,
-        };
-
-        let text = extract_selection_text(
-            &snapshot,
-            SelectionPoint { row: 0, col: 2 },
-            SelectionPoint { row: 2, col: 3 },
-        );
-
-        assert_eq!(text, "2345\nabcdef\nuvwx");
-    }
-
-    #[test]
-    fn extract_selection_text_skips_wide_char_spacers() {
-        let snapshot = ScreenSnapshot {
-            cells: vec![vec![
-                wide_cell('你'),
-                cell(' '),
-                wide_cell('好'),
-                cell(' '),
-                cell('X'),
-            ]],
-            cursor_row: 0,
-            cursor_col: 0,
-            cursor_visible: true,
-            alt_screen: false,
-        };
-
-        let text = extract_selection_text(
-            &snapshot,
-            SelectionPoint { row: 0, col: 0 },
-            SelectionPoint { row: 0, col: 4 },
-        );
-
-        assert_eq!(text, "你好X");
-    }
-
-    #[test]
-    fn extract_selection_text_preserves_cell_zerowidth_sequence() {
-        let snapshot = ScreenSnapshot {
-            cells: vec![vec![
-                cell('A'),
-                cell_with_zerowidth('\u{1f4c1}', vec!['\u{fe0f}']),
-                cell('B'),
-            ]],
-            cursor_row: 0,
-            cursor_col: 0,
-            cursor_visible: true,
-            alt_screen: false,
-        };
-
-        let text = extract_selection_text(
-            &snapshot,
-            SelectionPoint { row: 0, col: 0 },
-            SelectionPoint { row: 0, col: 2 },
-        );
-
-        assert_eq!(text, "A\u{1f4c1}\u{fe0f}B");
     }
 
     #[test]
@@ -2221,29 +2002,5 @@ mod tests {
             encode_mouse_report(0, 0, 0, false, ctrl, mode),
             Some(b"\x1b[<16;1;1m".to_vec())
         );
-    }
-
-    fn cell(ch: char) -> CellSnapshot {
-        CellSnapshot {
-            ch,
-            ..CellSnapshot::default()
-        }
-    }
-
-    fn wide_cell(ch: char) -> CellSnapshot {
-        CellSnapshot {
-            ch,
-            width_cols: 2,
-            spans_next_col: true,
-            ..CellSnapshot::default()
-        }
-    }
-
-    fn cell_with_zerowidth(ch: char, zerowidth: Vec<char>) -> CellSnapshot {
-        CellSnapshot {
-            ch,
-            zerowidth,
-            ..CellSnapshot::default()
-        }
     }
 }

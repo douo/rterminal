@@ -1,13 +1,19 @@
 use gpui::{
     ClipboardItem, Context, FocusHandle, FontFallbacks, FontStyle, FontWeight, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta,
-    ScrollWheelEvent, Window, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
+    ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 
 use crate::cli::Theme;
-use crate::input::selection_contains_cell;
-use crate::render::{LINE_HEIGHT_SCALE, TEXT_PADDING_X, TEXT_PADDING_Y, measure_cell_width};
-use crate::terminal::{CellSnapshot, SelectionPoint};
+use crate::grid_cells::{
+    CellSnapshot, SelectionPoint, cell_advance_cols, extract_selection_text,
+    normalize_selection_bounds, normalize_selection_col, row_text_without_wide_spacers,
+    selection_contains_cell,
+};
+use crate::render::{
+    TEXT_PADDING_X, TEXT_PADDING_Y, build_terminal_font, line_height_for, measure_cell_width,
+    palette_for,
+};
 
 #[derive(Clone)]
 pub(crate) struct SnapshotTabData {
@@ -18,28 +24,6 @@ pub(crate) struct SnapshotTabData {
     pub(crate) font_fallbacks: Option<FontFallbacks>,
     pub(crate) font_size: Pixels,
     pub(crate) theme: Theme,
-}
-
-#[derive(Clone, Copy)]
-struct SnapshotPalette {
-    app_bg: gpui::Hsla,
-    terminal_bg: gpui::Hsla,
-    selection_bg: gpui::Hsla,
-}
-
-fn palette_for(theme: Theme) -> SnapshotPalette {
-    match theme {
-        Theme::Default => SnapshotPalette {
-            app_bg: rgb(0x0f1115).into(),
-            terminal_bg: rgb(0x000000).into(),
-            selection_bg: rgba(0x4b93ffaa).into(),
-        },
-        Theme::EyeCare => SnapshotPalette {
-            app_bg: rgb(0x151b17).into(),
-            terminal_bg: rgb(0x1b241e).into(),
-            selection_bg: rgba(0x7ca67899).into(),
-        },
-    }
 }
 
 pub(crate) struct SnapshotTab {
@@ -81,7 +65,7 @@ impl SnapshotTab {
     }
 
     fn line_height(&self) -> Pixels {
-        (self.font_size * LINE_HEIGHT_SCALE).max(self.font_size + px(2.0))
+        line_height_for(self.font_size)
     }
 
     fn visible_rows_for_height(&self, height: Pixels) -> usize {
@@ -459,107 +443,7 @@ impl Render for SnapshotTab {
 }
 
 fn estimate_visible_rows(height: Pixels, font_size: Pixels) -> usize {
-    let line_height = (font_size * LINE_HEIGHT_SCALE).max(font_size + px(2.0));
+    let line_height = line_height_for(font_size);
     let usable = (height - (TEXT_PADDING_Y * 2.0)).max(line_height);
     ((usable / line_height).floor() as usize).max(1)
-}
-
-fn build_terminal_font(font_family: &str, font_fallbacks: Option<&FontFallbacks>) -> gpui::Font {
-    let mut mono = font(font_family.to_string());
-    mono.fallbacks = font_fallbacks.cloned();
-    mono
-}
-
-fn cell_advance_cols(cell: &CellSnapshot) -> usize {
-    if cell.spans_next_col {
-        usize::from(cell.width_cols.max(1))
-    } else {
-        1
-    }
-}
-
-fn normalize_selection_bounds(
-    start: SelectionPoint,
-    end: SelectionPoint,
-) -> (SelectionPoint, SelectionPoint) {
-    if (start.row, start.col) <= (end.row, end.col) {
-        (start, end)
-    } else {
-        (end, start)
-    }
-}
-
-fn normalize_selection_col(cells: &[CellSnapshot], col: usize) -> usize {
-    if cells.is_empty() {
-        return 0;
-    }
-    let mut normalized = col.min(cells.len().saturating_sub(1));
-    while normalized > 0 {
-        let prev = normalized - 1;
-        let prev_span = cell_advance_cols(&cells[prev]);
-        if prev_span > 1 && prev.saturating_add(prev_span) > normalized {
-            normalized = prev;
-            continue;
-        }
-        break;
-    }
-    normalized
-}
-
-fn extract_selection_text(
-    lines: &[Vec<CellSnapshot>],
-    start: SelectionPoint,
-    end: SelectionPoint,
-) -> String {
-    let mut out = Vec::new();
-    for row in start.row..=end.row {
-        let Some(cells) = lines.get(row) else {
-            break;
-        };
-        if cells.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let line_start = if row == start.row {
-            normalize_selection_col(cells, start.col)
-        } else {
-            0
-        };
-        let line_end = if row == end.row {
-            normalize_selection_col(cells, end.col)
-        } else {
-            cells.len().saturating_sub(1)
-        };
-        if line_start >= cells.len() {
-            out.push(String::new());
-            continue;
-        }
-        let clamped_end = line_end.min(cells.len().saturating_sub(1));
-        if line_start > clamped_end {
-            out.push(String::new());
-            continue;
-        }
-        let mut text = String::new();
-        let mut col = line_start;
-        while col <= clamped_end {
-            let cell = &cells[col];
-            cell.push_text_to(&mut text);
-            col = col.saturating_add(cell_advance_cols(cell));
-        }
-        let trimmed_len = text.trim_end().len();
-        text.truncate(trimmed_len);
-        out.push(text);
-    }
-    out.join("\n")
-}
-
-fn row_text_without_wide_spacers(cells: &[CellSnapshot]) -> String {
-    let mut text = String::new();
-    let mut col = 0usize;
-    while col < cells.len() {
-        let cell = &cells[col];
-        cell.push_text_to(&mut text);
-        col = col.saturating_add(cell_advance_cols(cell));
-    }
-    text
 }

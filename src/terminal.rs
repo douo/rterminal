@@ -23,8 +23,8 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::cli::{AmbiguousWidth, CliOptions, Theme};
+use crate::color::ansi_to_hsla;
 use crate::color::indexed_to_rgb;
-use crate::color::{ansi_bg_to_hsla, ansi_to_hsla};
 use crate::convenience::{
     ConvenienceState,
     input_method::{self, InputModeChangeListener},
@@ -33,6 +33,10 @@ use crate::debug_server::{
     DebugHttpConfig, DebugInputSink, SharedDebugState, start_debug_http_server,
 };
 use crate::font_fallback::font_fallback_families;
+pub(crate) use crate::grid_cells::{CellSnapshot, ScreenSnapshot, SelectionPoint};
+use crate::grid_cells::{
+    blank_cell, cell_advance_cols, row_text_without_wide_spacers, snapshot_cell,
+};
 use crate::input::{ExternalFileDragState, FocusActivationMouseGuard};
 use crate::input_log::InputLogger;
 use crate::keyboard::encode_keystroke;
@@ -181,87 +185,6 @@ impl EventListener for TitleTrackingListener {
             _ => {}
         }
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct CellSnapshot {
-    pub(crate) ch: char,
-    pub(crate) zerowidth: Vec<char>,
-    pub(crate) fg: gpui::Hsla,
-    pub(crate) bg: Option<gpui::Hsla>,
-    pub(crate) link: Option<String>,
-    pub(crate) bold: bool,
-    pub(crate) italic: bool,
-    pub(crate) underline: bool,
-    pub(crate) undercurl: bool,
-    pub(crate) strikethrough: bool,
-    pub(crate) width_cols: u8,
-    pub(crate) spans_next_col: bool,
-    pub(crate) expands_layout: bool,
-}
-
-impl Default for CellSnapshot {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            zerowidth: Vec::new(),
-            fg: gpui::Hsla::default(),
-            bg: None,
-            link: None,
-            bold: false,
-            italic: false,
-            underline: false,
-            undercurl: false,
-            strikethrough: false,
-            width_cols: 1,
-            spans_next_col: false,
-            expands_layout: false,
-        }
-    }
-}
-
-fn cell_style_flags(flags: Flags) -> (bool, bool, bool, bool, bool) {
-    (
-        flags.contains(Flags::BOLD),
-        flags.contains(Flags::ITALIC),
-        flags.intersects(Flags::ALL_UNDERLINES),
-        flags.contains(Flags::UNDERCURL),
-        flags.contains(Flags::STRIKEOUT),
-    )
-}
-
-impl CellSnapshot {
-    pub(crate) fn push_text_to(&self, text: &mut String) {
-        text.push(self.ch);
-        text.extend(self.zerowidth.iter().copied());
-    }
-
-    pub(crate) fn text(&self) -> String {
-        let mut text = String::with_capacity(
-            self.ch.len_utf8() + self.zerowidth.iter().map(|ch| ch.len_utf8()).sum::<usize>(),
-        );
-        self.push_text_to(&mut text);
-        text
-    }
-
-    pub(crate) fn is_blank(&self) -> bool {
-        self.ch == ' ' && self.zerowidth.is_empty()
-    }
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct ScreenSnapshot {
-    pub(crate) cells: Vec<Vec<CellSnapshot>>,
-    pub(crate) cursor_row: usize,
-    pub(crate) cursor_col: usize,
-    pub(crate) cursor_visible: bool,
-    pub(crate) alt_screen: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SelectionPoint {
-    pub(crate) row: usize,
-    pub(crate) col: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -788,32 +711,13 @@ impl AgentTerminal {
         let rows = self.grid_size.rows as usize;
         let cols = self.grid_size.cols as usize;
         let alt_screen = content.mode.contains(TermMode::ALT_SCREEN);
-        let mut cells = vec![
-            vec![
-                CellSnapshot {
-                    ch: ' ',
-                    zerowidth: Vec::new(),
-                    fg: ansi_to_hsla(
-                        AnsiColor::Named(NamedColor::Foreground),
-                        content.colors,
-                        Flags::empty(),
-                        true,
-                    ),
-                    bg: None,
-                    link: None,
-                    bold: false,
-                    italic: false,
-                    underline: false,
-                    undercurl: false,
-                    strikethrough: false,
-                    width_cols: 1,
-                    spans_next_col: false,
-                    expands_layout: false,
-                };
-                cols
-            ];
-            rows
-        ];
+        let default_fg = ansi_to_hsla(
+            AnsiColor::Named(NamedColor::Foreground),
+            content.colors,
+            Flags::empty(),
+            true,
+        );
+        let mut cells = vec![vec![blank_cell(default_fg); cols]; rows];
 
         for indexed in content.display_iter {
             let row = indexed.point.line.0;
@@ -827,51 +731,13 @@ impl AgentTerminal {
                 continue;
             }
 
-            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
+            if let Some(snapshot) = snapshot_cell(
+                indexed.cell,
+                content.colors,
+                &self.forced_double_width_chars,
+            ) {
+                cells[row][col] = snapshot;
             }
-
-            let mut fg = indexed.cell.fg;
-            let mut bg = indexed.cell.bg;
-            if indexed.cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-
-            let ch = if indexed.cell.flags.contains(Flags::HIDDEN) {
-                ' '
-            } else {
-                indexed.cell.c
-            };
-            let zerowidth = if indexed.cell.flags.contains(Flags::HIDDEN) {
-                Vec::new()
-            } else {
-                indexed.cell.zerowidth().unwrap_or(&[]).to_vec()
-            };
-            let spans_next_col = indexed.cell.flags.contains(Flags::WIDE_CHAR);
-            let expands_layout = !spans_next_col && self.forced_double_width_chars.contains(&ch);
-            let width_cols = if spans_next_col || expands_layout {
-                2
-            } else {
-                1
-            };
-            let (bold, italic, underline, undercurl, strikethrough) =
-                cell_style_flags(indexed.cell.flags);
-
-            cells[row][col] = CellSnapshot {
-                ch,
-                zerowidth,
-                fg: ansi_to_hsla(fg, content.colors, indexed.cell.flags, true),
-                bg: ansi_bg_to_hsla(bg, content.colors),
-                link: indexed.cell.hyperlink().map(|link| link.uri().to_string()),
-                bold,
-                italic,
-                underline,
-                undercurl,
-                strikethrough,
-                width_cols,
-                spans_next_col,
-                expands_layout,
-            };
         }
         annotate_plain_text_links(&mut cells);
 
@@ -1079,73 +945,14 @@ impl AgentTerminal {
 
         let mut lines = Vec::with_capacity((bottom - top + 1).max(0) as usize);
         for line_index in top..=bottom {
-            let mut row = vec![
-                CellSnapshot {
-                    ch: ' ',
-                    zerowidth: Vec::new(),
-                    fg: default_fg,
-                    bg: None,
-                    link: None,
-                    bold: false,
-                    italic: false,
-                    underline: false,
-                    undercurl: false,
-                    strikethrough: false,
-                    width_cols: 1,
-                    spans_next_col: false,
-                    expands_layout: false,
-                };
-                cols
-            ];
+            let mut row = vec![blank_cell(default_fg); cols];
 
             for col in 0..cols {
                 let cell = &grid[Line(line_index)][Column(col)];
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
+                if let Some(snapshot) = snapshot_cell(cell, colors, &self.forced_double_width_chars)
+                {
+                    row[col] = snapshot;
                 }
-
-                let mut fg = cell.fg;
-                let mut bg = cell.bg;
-                if cell.flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-
-                let ch = if cell.flags.contains(Flags::HIDDEN) {
-                    ' '
-                } else {
-                    cell.c
-                };
-                let zerowidth = if cell.flags.contains(Flags::HIDDEN) {
-                    Vec::new()
-                } else {
-                    cell.zerowidth().unwrap_or(&[]).to_vec()
-                };
-                let spans_next_col = cell.flags.contains(Flags::WIDE_CHAR);
-                let expands_layout =
-                    !spans_next_col && self.forced_double_width_chars.contains(&ch);
-                let width_cols = if spans_next_col || expands_layout {
-                    2
-                } else {
-                    1
-                };
-                let (bold, italic, underline, undercurl, strikethrough) =
-                    cell_style_flags(cell.flags);
-
-                row[col] = CellSnapshot {
-                    ch,
-                    zerowidth,
-                    fg: ansi_to_hsla(fg, colors, cell.flags, true),
-                    bg: ansi_bg_to_hsla(bg, colors),
-                    link: cell.hyperlink().map(|link| link.uri().to_string()),
-                    bold,
-                    italic,
-                    underline,
-                    undercurl,
-                    strikethrough,
-                    width_cols,
-                    spans_next_col,
-                    expands_layout,
-                };
             }
             annotate_plain_text_links_for_row(&mut row);
 
@@ -1596,25 +1403,6 @@ fn parse_font_fallbacks(raw: &[String]) -> Option<FontFallbacks> {
     }
 }
 
-fn cell_advance_cols(cell: &CellSnapshot) -> usize {
-    if cell.spans_next_col {
-        usize::from(cell.width_cols.max(1))
-    } else {
-        1
-    }
-}
-
-fn row_text_without_wide_spacers(row: &[CellSnapshot]) -> String {
-    let mut text = String::new();
-    let mut col = 0usize;
-    while col < row.len() {
-        let cell = &row[col];
-        cell.push_text_to(&mut text);
-        col = col.saturating_add(cell_advance_cols(cell));
-    }
-    text
-}
-
 fn parse_double_width_chars(raw: &[String]) -> HashSet<char> {
     raw.iter()
         .flat_map(|entry| entry.chars())
@@ -1970,19 +1758,6 @@ mod tests {
             links,
             vec![(5, 33, "https://example.com/path?q=1".to_string())]
         );
-    }
-
-    #[test]
-    fn cell_style_flags_preserve_terminal_text_styles() {
-        let (bold, italic, underline, undercurl, strikethrough) = cell_style_flags(
-            Flags::BOLD | Flags::ITALIC | Flags::UNDERLINE | Flags::UNDERCURL | Flags::STRIKEOUT,
-        );
-
-        assert!(bold);
-        assert!(italic);
-        assert!(underline);
-        assert!(undercurl);
-        assert!(strikethrough);
     }
 
     #[test]

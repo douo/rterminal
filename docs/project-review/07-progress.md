@@ -51,6 +51,64 @@
   实测机上那个旧实例正占着 13 个端口，是这个泄漏的实证。
 - README 组件行数表仍过时，留待阶段 5 的 ENG-9 一起修。
 
-## 阶段 1 · 输入保真与存活性 —— 进行中
+## 阶段 1 · 输入保真与存活性 —— 已完成
 
-见 [06-work-plan.md](06-work-plan.md#阶段-1--输入保真与存活性34-天)。
+| 缺陷 | 状态 | 提交 |
+|---|---|---|
+| COR-1 Ctrl+标点误编码（`Ctrl+-` 发 CR 执行命令行） | 已修 | `78b0c4b` |
+| COR-7 Ctrl+Alt 丢 ESC 前缀 | 已修 | `78b0c4b` |
+| COR-9 死键双重输入 | 已修 | `78b0c4b` |
+| COR-2 `unmarkText` 丢弃整段组合 | 已修 | `d86d8de` |
+| COR-6 组合中粘贴/拖放不处理 marked text | 已修 | `d86d8de` |
+| COR-14 点击丢弃而非提交组合 | 已修 | `d86d8de` |
+| COR-3 SGR release 丢按钮号 | 已修 | `8e1684e` |
+| COR-8 focus guard 滞留吞掉下次 release | 已修 | `8e1684e` |
+| COR-11 Cmd+A 在 alt-screen 误发 Ctrl-U | 已修 | `8e1684e` |
+| ROB-3 reader 静默退出 + 不重试 EINTR | 已修 | `6bb13ba` |
+| ROB-4 子进程从不 wait 导致僵尸 | 已修 | `6bb13ba` |
+| SEC-7 纯 ASCII 多行粘贴不触发确认 | 已修 | `4a078de` |
+| SEC-6 input log 明文 + 0644 | 已修 | `4a078de` |
+| ROB-2 PTY 写阻塞 UI 线程 | 已修 | `d7abdab` |
+| ROB-5 输出通道无背压 | 已修 | `d7abdab` |
+| SEC-3 debug 写绕过主线程与影子模型 | 已修 | `a774876` |
+
+### 验收记录
+
+- `scripts/check.sh` 全绿。主 crate 测试 **105 → 120**，workspace 合计 **301**。
+- 新增回归测试要点：
+  - Ctrl+标点编码表，含"`Ctrl+-` 不再发 CR""`Ctrl+3` 不再发 XOFF"的负向断言；
+  - focus guard 的"拖出表面松开"序列；
+  - SGR release 保留按钮号与修饰位；
+  - 粘贴风险判定（`curl … | sh` 形态必须确认）；
+  - PTY 投递不阻塞调用方（用永远写不动的 writer 模拟卡死的 PTY）、字节顺序不变。
+- 端到端验证：
+  - 向不读 stdin 的 `sleep 60` 注入 200 KB → 请求 0.47 ms 返回，应用保持响应；
+  - shell 自己 `exit` 后 tab 保持打开 → 子进程已从进程表消失，无 `STAT=Z`；
+  - 新建 input log 权限为 `-rw-------`，`--input-log-raw` 打印警示；
+  - debug 注入经主线程抵达 shell，`injected_events` 计数正确。
+
+### 遗留与偏差
+
+- **IME 三条（COR-2 / COR-6 / COR-14）没有自动化测试。** `AgentTerminal` 需要 gpui 的
+  `Window`/`Context`，无法在单元测试里构造，项目也没有 gpui `TestAppContext` 脚手架
+  （`input.rs` 现有测试全是纯函数）。真实的 IME 组合路径需要人工用中文输入法验证。
+  **建议单独排一项"搭 gpui 测试脚手架"**——它能同时解锁 IME、焦点、渲染这三块目前
+  完全测不到的区域，价值高于任何单条 bug 修复。COR-11 同样受此限制。
+- **SEC-3 的"模型确实同步了"无法观测。** `/debug/state` 不含 `input_line`，
+  所以只能给出结构性依据（注入现在调用键盘路径的同两个函数）。要可观测需给
+  `/debug/state` 加字段，属 `research/api-system-plan.md` 范畴。
+- **ROB-2 差点悄悄削弱 SEC-1 的回归测试。** 写入变异步后，"未认证不得落到 PTY"
+  那几条如果立刻检查空 sink 就会**假通过**——被拒的请求和"还没写完"的请求看起来
+  一样。已改成先给 100 ms 时间窗口再断言。这类"异步化削弱既有反向断言"的连带风险
+  值得在后续阶段留意。
+- **两个既有测试编码的是 bug 行为**（断言纯 ASCII 4 行粘贴"安全"），已按新意图改写。
+  这是收紧而非放宽，与 iTerm2 的多行粘贴确认行为一致。
+- **写队列满时会丢弃并打日志**，而不是阻塞。取舍理由：那种情况意味着前台程序真的
+  不读 stdin 了，这次写本来也到不了子进程；静默堆积更糟。
+
+## 下一步
+
+阶段 2（去重 ARCH-2 / ARCH-4）**必须先于**阶段 3。理由见
+[06-work-plan.md](06-work-plan.md) 元原则 2：COR-4 / COR-5 / DSP-4 是同一类错误
+（列宽 vs 字符数 vs UTF-16 单元 vs 像素除法），之所以能各自独立写错，是因为
+`cell_advance_cols` 有 4 份拷贝。先统一再修，否则修 3 处漏 1 处。

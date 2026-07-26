@@ -29,7 +29,9 @@ use crate::convenience::{
     ConvenienceState,
     input_method::{self, InputModeChangeListener},
 };
-use crate::debug_server::{DebugHttpConfig, SharedDebugState, start_debug_http_server};
+use crate::debug_server::{
+    DebugHttpConfig, DebugInputSink, SharedDebugState, start_debug_http_server,
+};
 use crate::font_fallback::font_fallback_families;
 use crate::input::{ExternalFileDragState, FocusActivationMouseGuard};
 use crate::input_log::InputLogger;
@@ -338,6 +340,8 @@ pub(crate) struct AgentTerminal {
     pub(crate) _focus_out_sub: Option<Subscription>,
     pub(crate) input_method_watch_task: Option<Task<Result<()>>>,
     pub(crate) _pump_task: Task<Result<()>>,
+    /// 主线程消费 debug 注入的任务（仅在 --debug-http 开启时存在）。
+    pub(crate) _debug_input_task: Option<Task<Result<()>>>,
 }
 
 impl AgentTerminal {
@@ -429,6 +433,7 @@ impl AgentTerminal {
         let processor = Processor::<StdSyncHandler>::new();
 
         // 默认不启动：这个接口能往 PTY 写任意字节，等于在用户 shell 里执行任意命令。
+        let mut debug_input_rx = None;
         if cli.debug_http {
             match DebugHttpConfig::new(cli.debug_http_token.clone(), cli.debug_http_allow_remote) {
                 Some(config) => {
@@ -437,7 +442,10 @@ impl AgentTerminal {
                         "debug http enabled; authenticate with header \"X-Debug-Token: {}\"",
                         config.token()
                     );
-                    start_debug_http_server(debug.clone(), writer.clone(), config);
+                    // 注入走主线程（见 DebugInputSink），不让 HTTP 线程自己写 PTY。
+                    let (sink, rx) = DebugInputSink::channel();
+                    debug_input_rx = Some(rx);
+                    start_debug_http_server(debug.clone(), Some(sink), config);
                 }
                 None => {
                     let message = "refusing to start debug server: could not read /dev/urandom \
@@ -539,6 +547,7 @@ impl AgentTerminal {
             _focus_out_sub: None,
             input_method_watch_task: None,
             _pump_task: Task::ready(Ok(())),
+            _debug_input_task: None,
         };
 
         this.refresh_snapshot();
@@ -612,6 +621,23 @@ impl AgentTerminal {
                 });
                 Ok(())
             });
+        }
+
+        if let Some(rx) = debug_input_rx {
+            // debug 注入在主线程上应用，走的是和键盘输入**完全相同**的路径：
+            // write_bytes + apply_terminal_bytes_to_input_line。此前 HTTP 线程绕过主线程
+            // 直接写 PTY，注入的字节因此不更新影子输入行模型——而那个模型正是本项目
+            // 通过 AX 暴露出去的"可信输入行"，外部工具会读到错的内容。
+            this._debug_input_task = Some(cx.spawn(async move |this, cx| {
+                while let Ok(bytes) = rx.recv().await {
+                    this.update(cx, |this, cx| {
+                        this.write_bytes(&bytes);
+                        this.apply_terminal_bytes_to_input_line(&bytes);
+                        cx.notify();
+                    })?;
+                }
+                Ok(())
+            }));
         }
 
         this

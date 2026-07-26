@@ -9,7 +9,37 @@ use serde::Serialize;
 use tiny_http::{Header, Response, Server, StatusCode};
 
 use crate::GridSize;
-use crate::pty::PtyWriteHandle;
+
+/// debug 接口注入字节的出口。
+///
+/// **不是**直接写 PTY。此前 HTTP 线程自己持锁写 PTY，绕过主线程，于是注入的字节
+/// 不会更新影子输入行模型（`input_line` / `input_cursor_utf16`）—— 而那个模型正是
+/// 本项目对外暴露的"可信输入行"，外部辅助工具会读到错的内容。
+///
+/// 现在投递到主线程，由 AgentTerminal 走和键盘输入完全相同的路径处理
+/// （write_bytes + apply_terminal_bytes_to_input_line），模型因此保持同步。
+#[derive(Clone)]
+pub(crate) struct DebugInputSink {
+    sender: async_channel::Sender<Vec<u8>>,
+}
+
+impl DebugInputSink {
+    pub(crate) fn channel() -> (Self, async_channel::Receiver<Vec<u8>>) {
+        let (sender, receiver) = async_channel::bounded(DEBUG_INPUT_QUEUE_CAPACITY);
+        (Self { sender }, receiver)
+    }
+
+    fn send(&self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        self.sender.try_send(bytes.to_vec()).is_ok()
+    }
+}
+
+/// debug 注入队列深度。这是一个调试接口，不需要很深；满了就明确拒绝，
+/// 让调用方知道自己发得太快，而不是悄悄堆积。
+const DEBUG_INPUT_QUEUE_CAPACITY: usize = 256;
 
 const DEBUG_HTTP_DEFAULT_HOST: &str = "127.0.0.1";
 const DEBUG_HTTP_DEFAULT_PORT_START: u16 = 37878;
@@ -291,7 +321,7 @@ impl SharedDebugState {
 
 pub(crate) fn start_debug_http_server(
     debug: SharedDebugState,
-    writer: Option<PtyWriteHandle>,
+    writer: Option<DebugInputSink>,
     config: DebugHttpConfig,
 ) {
     if let Some(addr) = std::env::var("AGENT_TUI_DEBUG_ADDR")
@@ -343,7 +373,7 @@ fn addr_is_loopback(addr: &str) -> bool {
 
 fn start_debug_http_server_on_default_port_range(
     debug: SharedDebugState,
-    writer: Option<PtyWriteHandle>,
+    writer: Option<DebugInputSink>,
     config: DebugHttpConfig,
 ) {
     let _ = thread::Builder::new()
@@ -395,7 +425,7 @@ fn next_default_debug_http_addr() -> String {
 
 pub(crate) fn start_debug_http_server_at_addr(
     debug: SharedDebugState,
-    writer: Option<PtyWriteHandle>,
+    writer: Option<DebugInputSink>,
     addr: String,
     config: DebugHttpConfig,
 ) {
@@ -417,7 +447,7 @@ pub(crate) fn start_debug_http_server_at_addr(
 fn serve_debug_http(
     server: Server,
     debug: SharedDebugState,
-    writer: Option<PtyWriteHandle>,
+    writer: Option<DebugInputSink>,
     addr: String,
     config: DebugHttpConfig,
 ) {
@@ -506,7 +536,7 @@ pub(crate) fn handle_debug_request(
     method: &str,
     path: &str,
     debug: &SharedDebugState,
-    writer: Option<&PtyWriteHandle>,
+    writer: Option<&DebugInputSink>,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     match (method, path) {
         ("GET", "/debug") => text_response(
@@ -553,11 +583,11 @@ pub(crate) fn handle_debug_request(
                 return text_response(400, "text/plain; charset=utf-8", "input body is empty\n");
             }
 
-            if writer.write(&body) {
+            if writer.send(&body) {
                 debug.record_bytes_to_pty(body.len(), true);
                 text_response(200, "text/plain; charset=utf-8", "input injected\n")
             } else {
-                debug.set_error("debug input write failed: pty writer queue rejected the bytes");
+                debug.set_error("debug input rejected: the injection queue is full");
                 text_response(500, "text/plain; charset=utf-8", "failed to write to pty\n")
             }
         }
@@ -580,13 +610,11 @@ pub(crate) fn handle_debug_request(
             payload.push(0x15);
             payload.extend_from_slice(&body);
 
-            if writer.write(&payload) {
+            if writer.send(&payload) {
                 debug.record_bytes_to_pty(payload.len(), true);
                 text_response(200, "text/plain; charset=utf-8", "input line replaced\n")
             } else {
-                debug.set_error(
-                    "debug replace-line write failed: pty writer queue rejected the bytes",
-                );
+                debug.set_error("debug replace-line rejected: the injection queue is full");
                 text_response(500, "text/plain; charset=utf-8", "failed to write to pty\n")
             }
         }
@@ -824,15 +852,21 @@ mod tests {
             GridSize { cols: 80, rows: 24 },
         );
         let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(BufferWriter { sink: sink.clone() })));
+        let (input_sink, receiver) = DebugInputSink::channel();
 
-        start_debug_http_server_at_addr(
-            debug,
-            Some(PtyWriteHandle::spawn(writer)),
-            addr.clone(),
-            test_config(),
-        );
+        // 模拟生产环境里主线程那一端：把投递过来的字节应用掉。
+        // 真实实现走 write_bytes + apply_terminal_bytes_to_input_line，
+        // 这里只需要证明"字节确实被投递出去了"。
+        {
+            let sink = sink.clone();
+            thread::spawn(move || {
+                while let Ok(bytes) = receiver.recv_blocking() {
+                    sink.lock().extend_from_slice(&bytes);
+                }
+            });
+        }
+
+        start_debug_http_server_at_addr(debug, Some(input_sink), addr.clone(), test_config());
         wait_for_server(&addr);
         (addr, sink)
     }
@@ -907,20 +941,5 @@ mod tests {
             .read_to_string(&mut response)
             .expect("read response from debug server");
         response
-    }
-
-    struct BufferWriter {
-        sink: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl Write for BufferWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.sink.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 }

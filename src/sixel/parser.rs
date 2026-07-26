@@ -64,7 +64,22 @@ enum SixelStreamState {
         raw: Vec<u8>,
         payload: Vec<u8>,
         pending_escape: bool,
+        /// 还差几个 UTF-8 连续字节没读完。裸 0x9c（C1 ST）只有在**不是**连续字节
+        /// 时才是终止符（DSP-12）：SIXEL 载荷是纯 ASCII 不受影响，但含 UTF-8 的
+        /// 未知 DCS / tmux passthrough 里，多字节字符的第二字节完全可能是 0x9c
+        ///（如 U+011C 'Ĝ' = C4 9C），按终止符处理会把序列拦腰截断。
+        utf8_continuations: u8,
     },
+}
+
+/// 该字节作为 UTF-8 首字节时后面跟几个连续字节（非首字节返回 0）。
+fn utf8_continuation_len(byte: u8) -> u8 {
+    match byte {
+        0xc2..=0xdf => 1,
+        0xe0..=0xef => 2,
+        0xf0..=0xf4 => 3,
+        _ => 0,
+    }
 }
 
 impl SixelStreamParser {
@@ -122,6 +137,7 @@ impl SixelStreamParser {
                         raw,
                         payload: Vec::new(),
                         pending_escape: false,
+                        utf8_continuations: 0,
                     }
                 } else {
                     SixelStreamState::DcsEntry { raw }
@@ -132,11 +148,18 @@ impl SixelStreamParser {
                 mut raw,
                 mut payload,
                 mut pending_escape,
+                mut utf8_continuations,
             } => {
                 raw.push(byte);
+                let inside_utf8_char = utf8_continuations > 0;
+                if inside_utf8_char {
+                    utf8_continuations -= 1;
+                } else {
+                    utf8_continuations = utf8_continuation_len(byte);
+                }
                 if aborts_control_sequence(byte) || raw.len() > self.max_dcs_bytes {
                     abandon_dcs(&raw, output)
-                } else if byte == 0x9c {
+                } else if byte == 0x9c && !inside_utf8_char {
                     self.finish_dcs(action, raw, payload, output, actions);
                     SixelStreamState::Ground
                 } else if pending_escape {
@@ -148,6 +171,7 @@ impl SixelStreamParser {
                             raw,
                             payload,
                             pending_escape: false,
+                            utf8_continuations,
                         }
                     } else if byte == b'\\' {
                         self.finish_dcs(action, raw, payload, output, actions);
@@ -161,6 +185,7 @@ impl SixelStreamParser {
                             raw,
                             payload,
                             pending_escape,
+                            utf8_continuations,
                         }
                     }
                 } else if byte == 0x1b {
@@ -170,6 +195,7 @@ impl SixelStreamParser {
                         raw,
                         payload,
                         pending_escape,
+                        utf8_continuations,
                     }
                 } else {
                     payload.push(byte);
@@ -178,6 +204,7 @@ impl SixelStreamParser {
                         raw,
                         payload,
                         pending_escape,
+                        utf8_continuations,
                     }
                 }
             }
@@ -298,6 +325,34 @@ mod tests {
             // 中止字节本身也原样透传，让下游 VTE 自己处理中止语义。
             assert_eq!(bytes, input);
         }
+    }
+
+    /// 回归（DSP-12）：UTF-8 连续字节里的 0x9c 不是 ST。
+    /// 'Ĝ'（U+011C）编码为 C4 9C——按裸终止符处理会把含 UTF-8 的 DCS 拦腰截断。
+    #[test]
+    fn sixel_stream_parser_ignores_9c_inside_utf8_sequences() {
+        let mut parser = SixelStreamParser::default();
+        let mut input = Vec::from(b"\x1bPx".as_slice());
+        input.extend_from_slice("aĜb".as_bytes());
+        input.extend_from_slice(b"\x1b\\");
+
+        let actions = parser.advance(&input);
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SixelStreamAction::UnknownDcs(raw) => {
+                assert_eq!(raw, &input, "DCS 应完整走到 ESC \\ 终止，而不是被 9C 截断");
+            }
+            _ => panic!("expected a single unknown DCS action"),
+        }
+
+        // 真正的裸 0x9c（不在 UTF-8 序列内）仍然是有效终止符。
+        let mut parser = SixelStreamParser::default();
+        let actions = parser.advance(b"\x1bPq~\x9cafter");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            SixelStreamAction::Sixel(payload) if payload == b"~"
+        )));
     }
 
     #[test]

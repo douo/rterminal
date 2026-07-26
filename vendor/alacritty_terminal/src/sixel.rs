@@ -160,8 +160,28 @@ impl SixelDecoder {
                     self.set_pixel(self.x, self.y + bit);
                 }
             }
+            // 空列（'?'，全透明）同样计入图像宽度：无 `"` 光栅声明且以透明列收尾
+            // 的图片，宽度以最右一个被**描述过**的列为准，而不是最右一个置位像素。
+            self.mark_column(self.x, self.y);
             self.x = self.x.saturating_add(1);
         }
+    }
+
+    /// 与 [`Self::set_pixel`] 相同的越界/容量防护，但只扩画布并推进 `max_x`，
+    /// 不写像素（保持透明）。
+    fn mark_column(&mut self, x: usize, y: usize) {
+        if x >= MAX_SIXEL_DIMENSION || y >= MAX_SIXEL_DIMENSION {
+            return;
+        }
+        if x.saturating_add(1).saturating_mul(y.saturating_add(1)) > MAX_SIXEL_PIXELS {
+            return;
+        }
+
+        self.ensure_canvas(x + 1, y + 1);
+        if x >= self.width {
+            return;
+        }
+        self.max_x = self.max_x.max(x + 1);
     }
 
     fn set_pixel(&mut self, x: usize, y: usize) {
@@ -404,6 +424,20 @@ mod tests {
         for pixel in image.rgba.chunks_exact(4) {
             assert_eq!(pixel, &[255, 0, 0, 255]);
         }
+    }
+
+    /// 回归：无 `"` 光栅声明、以透明列（'?'）收尾的图片，宽度按最右被描述过的列
+    /// 计，而不是最右置位像素——否则宽度偏窄、占列计算随之偏小。
+    #[test]
+    fn transparent_trailing_columns_count_toward_width() {
+        let image = decode_sixel_payload(0, 0, b"#1;2;100;0;0~??").unwrap();
+
+        assert_eq!(image.width, 3);
+        assert_eq!(image.height, 6);
+        // 第一列有像素，后两列保持透明。
+        assert_eq!(&image.rgba[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&image.rgba[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&image.rgba[8..12], &[0, 0, 0, 0]);
     }
 
     #[test]

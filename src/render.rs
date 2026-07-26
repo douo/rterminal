@@ -30,11 +30,29 @@ pub(crate) fn measure_cell_width(
 ) -> Pixels {
     let mono = build_terminal_font(font_family, font_fallbacks);
     let font_id = window.text_system().resolve_font(&mono);
-    window
+    if let Ok(advance) = window.text_system().advance(font_id, font_size, 'M') {
+        return advance.width;
+    }
+
+    // advance 测量失败（字体名完全无效等）时，退到与渲染同一条 shaping 路径量
+    // 一个 'M'（DSP-13）：渲染仍会用系统回退字体的真实 advance 画字，网格/PTY
+    // winsize 必须用同一把尺子，否则视觉与网格错位。固定 px(8.0) 只是最后防线。
+    let run = gpui::TextRun {
+        len: 1,
+        font: mono,
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
         .text_system()
-        .advance(font_id, font_size, 'M')
-        .map(|advance| advance.width)
-        .unwrap_or(px(8.0))
+        .shape_line("M".into(), font_size, &[run], None);
+    if shaped.width > px(0.0) {
+        shaped.width
+    } else {
+        px(8.0)
+    }
 }
 
 pub(crate) fn build_terminal_font(

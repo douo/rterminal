@@ -117,11 +117,20 @@ where
 }
 
 fn preferred_family_name(face: &fontdb::FaceInfo) -> Option<String> {
+    // 优先取英文家族名（DSP-14）：`families[0]` 在非英文 locale 下可能是本地化
+    // 家族名（如「苹方-简」），交给 GPUI/CoreText 按名字解析存在失配风险；
+    // 英文名（PingFang SC）才是稳定标识。没有英文名时再退回第一个非空名。
     face.families
         .iter()
-        .map(|(family, _)| family.trim())
-        .find(|family| !family.is_empty())
-        .map(str::to_string)
+        .find(|(family, language)| {
+            *language == fontdb::Language::English_UnitedStates && !family.trim().is_empty()
+        })
+        .or_else(|| {
+            face.families
+                .iter()
+                .find(|(family, _)| !family.trim().is_empty())
+        })
+        .map(|(family, _)| family.trim().to_string())
 }
 
 fn upsert_candidate(candidates: &mut Vec<FontCandidate>, candidate: FontCandidate) {

@@ -1,7 +1,7 @@
 # 工作计划
 
 > 综合产物 · 制定日期 2026-07-26 · 审查基线 `main @ c4301f9`
-> 缺陷编号见 [05-bug-ledger.md](05-bug-ledger.md)。本计划**尚未执行任何改动**。
+> 缺陷编号见 [05-bug-ledger.md](05-bug-ledger.md)。执行进度见 [07-progress.md](07-progress.md)。
 
 ---
 

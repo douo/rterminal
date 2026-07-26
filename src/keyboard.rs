@@ -408,6 +408,43 @@ fn modifier_code(keystroke: &gpui::Keystroke) -> u8 {
     code + 1
 }
 
+/// Ctrl+键 → 控制字节。表外的键**不发送任何字节**。
+///
+/// 之前这里对任意单字节 ASCII 键统一做 `to_ascii_lowercase() & 0x1f`，可那个运算只对
+/// 字母和少数符号有意义。对标点和数字它会产出完全无关的控制字节，而且不是"没反应"
+/// 这种无害的错，是会动到用户数据的错：
+///
+/// - `Ctrl+-` → `0x2d & 0x1f` = `0x0d` = **CR**，等于替用户按回车、执行掉当前命令行
+/// - `Ctrl+3` → `0x13` = XOFF，在开了 ixon 的终端里直接冻结输出
+/// - `Ctrl+2` → `0x12` = ^R，误触发 bash 的反向搜索
+/// - `Ctrl+;` → `0x1b` = ESC，把 vim 踢出插入模式
+///
+/// 表与 alacritty 的 `ctrl_mapping` 一致（本项目本来就用它的 VT 状态机，行为对齐它
+/// 比自创一套更可靠）。宁可什么都不发，也不要猜一个字节出来。
+///
+/// 注意 `Ctrl+Space` → NUL 不在这里：它的 key 是 `"space"`（多字符），
+/// 在 `encode_special_keystroke` 里已经处理过了。
+fn ctrl_mapping(key: &str) -> Option<u8> {
+    let mut chars = key.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+
+    Some(match ch {
+        '@' => 0x00,
+        'a'..='z' => ch as u8 - 0x60,
+        'A'..='Z' => ch as u8 - 0x40,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        '_' => 0x1f,
+        '?' => 0x7f,
+        _ => return None,
+    })
+}
+
 fn encode_printable_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
     let key = keystroke.key.as_str();
     let ctrl = keystroke.modifiers.control;
@@ -419,12 +456,15 @@ fn encode_printable_keystroke(keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
     }
 
     if ctrl {
-        if key.len() == 1 && key.is_ascii() {
-            let mut ch = key.as_bytes()[0];
-            ch = ch.to_ascii_lowercase() & 0x1f;
-            return Some(vec![ch]);
+        let byte = ctrl_mapping(key)?;
+
+        // Ctrl+Alt+x 的 xterm 传统是 ESC 前缀 + ctrl 字节（如 \x1b\x18）。
+        // 少了前缀，Emacs 的 C-M-* 和 readline 的对应绑定会全部失效，
+        // 而且会被误当成纯 Ctrl 组合。
+        if keystroke.modifiers.alt {
+            return Some(vec![0x1b, byte]);
         }
-        return None;
+        return Some(vec![byte]);
     }
 
     if let Some(key_char) = keystroke
@@ -467,10 +507,33 @@ pub(crate) fn should_defer_to_text_input(
         return false;
     }
 
+    // 死键（Option+E/I/N/U/`）此刻 key_char 还是 None —— macOS 刚开始一段重音组合，
+    // 字符要等下一次按键才定。如果这里不 defer，就会掉进编码路径发出 ESC+key，
+    // 随后 IME 又提交组合结果，PTY 收到 "ESC e" **加** "é"：双重输入，而且那个 ESC
+    // 可能把编辑器切进 vi-mode。
+    //
+    // 只对"单个可打印字符"形态的键这么做：Alt+F1 之类必须继续走编码路径，
+    // 否则会被无声吞掉。
+    if modifiers.alt
+        && !option_as_meta
+        && keystroke.key_char.is_none()
+        && is_single_printable_key(keystroke.key.as_str())
+    {
+        return true;
+    }
+
     keystroke
         .key_char
         .as_ref()
         .is_some_and(|ch| !ch.is_empty() && !ch.chars().any(|c| c.is_control()))
+}
+
+fn is_single_printable_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => !ch.is_control() && !ch.is_whitespace(),
+        _ => false,
+    }
 }
 
 fn is_terminal_control_key_name(key: &str) -> bool {
@@ -556,6 +619,109 @@ fn key_matches(key: &str, accepted: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctrl(key: &str) -> gpui::Keystroke {
+        gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::none()
+            },
+            key: key.to_string(),
+            key_char: None,
+        }
+    }
+
+    /// 回归（COR-1）：Ctrl+标点/数字 曾经被 `& 0x1f` 打成完全无关的控制字节。
+    /// 其中 Ctrl+- 会发出 CR，等于替用户执行掉当前命令行。
+    /// 现在表外的键一个字节都不发。
+    #[test]
+    fn ctrl_punctuation_and_digits_send_nothing() {
+        for key in ["-", "/", "1", "2", "3", ";", ",", ".", "=", "'"] {
+            assert_eq!(
+                encode_keystroke(&ctrl(key)),
+                None,
+                "ctrl-{key} must not produce a control byte"
+            );
+        }
+    }
+
+    /// 具体钉住那几个最危险的旧行为，防止有人"顺手"把掩码写回来。
+    #[test]
+    fn ctrl_dash_no_longer_sends_carriage_return() {
+        assert_ne!(encode_keystroke(&ctrl("-")), Some(vec![b'\r']));
+        // 0x13 = XOFF，会冻结终端输出。
+        assert_ne!(encode_keystroke(&ctrl("3")), Some(vec![0x13]));
+        // 0x1b = ESC，会把 vim 踢出插入模式。
+        assert_ne!(encode_keystroke(&ctrl(";")), Some(vec![0x1b]));
+    }
+
+    #[test]
+    fn ctrl_letters_and_symbols_use_the_standard_table() {
+        assert_eq!(encode_keystroke(&ctrl("a")), Some(vec![0x01]));
+        assert_eq!(encode_keystroke(&ctrl("c")), Some(vec![0x03]));
+        assert_eq!(encode_keystroke(&ctrl("z")), Some(vec![0x1a]));
+        assert_eq!(encode_keystroke(&ctrl("@")), Some(vec![0x00]));
+        assert_eq!(encode_keystroke(&ctrl("[")), Some(vec![0x1b]));
+        assert_eq!(encode_keystroke(&ctrl("\\")), Some(vec![0x1c]));
+        assert_eq!(encode_keystroke(&ctrl("]")), Some(vec![0x1d]));
+        assert_eq!(encode_keystroke(&ctrl("^")), Some(vec![0x1e]));
+        assert_eq!(encode_keystroke(&ctrl("_")), Some(vec![0x1f]));
+        assert_eq!(encode_keystroke(&ctrl("?")), Some(vec![0x7f]));
+    }
+
+    #[test]
+    fn ctrl_space_still_sends_nul() {
+        let ks = gpui::Keystroke::parse("ctrl-space").expect("parse ctrl-space");
+        assert_eq!(encode_keystroke(&ks), Some(vec![0x00]));
+    }
+
+    /// 回归（COR-7）：Ctrl+Alt+x 的 xterm 传统是 ESC 前缀 + ctrl 字节。
+    /// 少了前缀，Emacs 的 C-M-* 与 readline 绑定全部失效。
+    #[test]
+    fn ctrl_alt_letter_gets_escape_prefix() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                alt: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "x".to_string(),
+            key_char: None,
+        };
+        assert_eq!(encode_keystroke(&ks), Some(vec![0x1b, 0x18]));
+    }
+
+    /// 回归（COR-9）：--no-option-as-meta 下的死键（Option+E 等）此刻 key_char 为 None，
+    /// 但 macOS 已经开始组合。此前会既发出 ESC+key 又提交组合结果 → 双重输入。
+    #[test]
+    fn dead_keys_defer_to_text_input_when_option_is_not_meta() {
+        let dead_key = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                alt: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "e".to_string(),
+            key_char: None,
+        };
+
+        assert!(should_defer_to_text_input(&dead_key, false));
+        // option_as_meta 打开时 Alt 就是 Meta，仍然走编码路径。
+        assert!(!should_defer_to_text_input(&dead_key, true));
+    }
+
+    /// 上面那条不能顺手把 Alt+功能键吞掉。
+    #[test]
+    fn alt_function_keys_still_reach_the_encoder() {
+        let alt_f1 = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                alt: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "f1".to_string(),
+            key_char: None,
+        };
+        assert!(!should_defer_to_text_input(&alt_f1, false));
+    }
 
     #[test]
     fn encodes_shift_tab() {

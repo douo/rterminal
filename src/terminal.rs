@@ -561,6 +561,9 @@ impl AgentTerminal {
             Some(
                 cx.on_focus_out(&this.focus_handle, window, |this, _event, window, cx| {
                     this.stop_input_method_listener();
+                    // 失焦时也清掉激活点击 guard：下一次获得焦点会带来新的 first_mouse，
+                    // 留着旧的只会吞掉之后某次正常点击的 release。
+                    this.focus_activation_mouse.clear();
                     this.flush_ime_context(window, cx);
                     if this.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                         this.write_bytes(b"\x1b[O");

@@ -53,10 +53,22 @@ impl FocusActivationMouseGuard {
     fn should_suppress_mouse_down(&mut self, first_mouse: bool, button: MouseButton) -> bool {
         if first_mouse && button == MouseButton::Left {
             self.button = Some(button);
-            true
-        } else {
-            false
+            return true;
         }
+
+        // 收到一次非 first_mouse 的按下，说明上一轮激活点击已经结束了——不管它的
+        // mouse-up 有没有回到本表面。不清这一下的话，guard 会滞留并吞掉**下一次**
+        // 正常点击的 release：
+        //   激活点击按在终端区 → 拖到标题栏/窗外松开 → 本表面收不到 mouse-up
+        //   → button 一直是 Some(Left) → 下次点击的 release 被提前 return 掉
+        //   → shift 选区无法结束且 selection_mode_active 残留（之后任意无 shift
+        //     拖动会"复活"选区），mouse-mode 应用则收到 press 没有 release，按钮卡死。
+        self.clear();
+        false
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.button = None;
     }
 
     fn should_suppress_mouse_move(&self, pressed_button: Option<MouseButton>) -> bool {
@@ -970,6 +982,15 @@ impl AgentTerminal {
         if is_select_all_shortcut(&event.keystroke) {
             self.mark_local_key_activity();
             self.debug.record_key_event();
+            // Cmd+A 在这里的语义是"清空 shell 输入行"，只对行编辑器有意义。
+            // alt screen 里跑的是 vim/less 这类全屏应用，0x15 会被它们当作正常输入：
+            // 在 vim 插入模式下删掉整行，在 less 里产生意外按键。
+            if self.snapshot.alt_screen {
+                self.trace_input("keydown cmd-a ignored on alt screen");
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             self.clear_input_line();
             self.write_bytes(&[0x15]); // Ctrl-U clears shell input line.
             self.trace_input("keydown cmd-a clear current input line");
@@ -1390,11 +1411,12 @@ fn encode_mouse_report(
 ) -> Option<Vec<u8>> {
     let mods = mouse_modifiers(modifiers);
     if mode.contains(TermMode::SGR_MOUSE) {
-        let effective_button = if pressed {
-            button.saturating_add(mods)
-        } else {
-            3u8.saturating_add(mods)
-        };
+        // SGR(1006) 的设计要点就是 release **保留原按钮号**，用 `m`/`M` 后缀区分按下
+        // 与松开。按钮 3 是 X10 时代"release/未知"的遗留编码，在 SGR 里发它等于告诉
+        // 应用"松开了某个不知道是哪个的键"——tmux/vim 因此无法配对按下与松开，
+        // 依赖 release 按钮号的拖拽/多键逻辑会错乱。`3+mods`（如 ctrl 松开时的 19）
+        // 更是规范外的组合。
+        let effective_button = button.saturating_add(mods);
         Some(
             format!(
                 "\x1b[<{};{};{}{}",
@@ -1896,11 +1918,12 @@ mod tests {
 
     use super::{
         ExternalFileDragState, FocusActivationMouseGuard, ax_text_matches_visible_input_context,
-        dropped_paths_text, evaluate_paste_risk, extract_selection_text,
+        dropped_paths_text, encode_mouse_report, evaluate_paste_risk, extract_selection_text,
         normalize_selection_bounds, probable_ascii_prefix_noise, selection_contains_cell,
         shell_escape_path,
     };
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
+    use alacritty_terminal::term::TermMode;
 
     #[test]
     fn paste_risk_requires_multiline_and_non_ascii_heavy_content() {
@@ -2104,6 +2127,70 @@ mod tests {
         assert!(!guard.should_suppress_mouse_up(MouseButton::Left));
         assert!(!guard.should_suppress_mouse_down(true, MouseButton::Right));
         assert!(!guard.should_suppress_mouse_up(MouseButton::Right));
+    }
+
+    /// 回归（COR-8）：激活点击的 mouse-up 落在本表面之外（拖到标题栏/窗外松开）时，
+    /// guard 会滞留，并吞掉**下一次**正常点击的 release。
+    #[test]
+    fn focus_activation_guard_does_not_leak_into_the_next_click() {
+        let mut guard = FocusActivationMouseGuard::default();
+
+        // 激活点击按下，然后把鼠标拖出表面松开——本表面永远收不到这次 mouse-up。
+        assert!(guard.should_suppress_mouse_down(true, MouseButton::Left));
+
+        // 下一次是正常点击：按下不该被抑制，而且它的 release 必须能正常通过，
+        // 否则 shift 选区结不掉、mouse-mode 应用的按钮会卡死。
+        assert!(!guard.should_suppress_mouse_down(false, MouseButton::Left));
+        assert!(!guard.should_suppress_mouse_up(MouseButton::Left));
+        assert!(!guard.should_suppress_mouse_move(Some(MouseButton::Left)));
+    }
+
+    #[test]
+    fn focus_activation_guard_clear_resets_pending_state() {
+        let mut guard = FocusActivationMouseGuard::default();
+
+        assert!(guard.should_suppress_mouse_down(true, MouseButton::Left));
+        guard.clear();
+        assert!(!guard.should_suppress_mouse_up(MouseButton::Left));
+    }
+
+    /// 回归（COR-3）：SGR(1006) 的 release 必须保留原按钮号，只用 m/M 后缀区分。
+    /// 此前一律发按钮 3（X10 时代的"release/未知"），tmux/vim 无法配对按下与松开。
+    #[test]
+    fn sgr_mouse_release_keeps_the_original_button() {
+        let mode = TermMode::SGR_MOUSE;
+        let mods = gpui::Modifiers::none();
+
+        // 左键：按下 <0 …M，松开 <0 …m
+        assert_eq!(
+            encode_mouse_report(4, 9, 0, true, mods, mode),
+            Some(b"\x1b[<0;10;5M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_report(4, 9, 0, false, mods, mode),
+            Some(b"\x1b[<0;10;5m".to_vec())
+        );
+
+        // 右键松开必须是 <2 …m，而不是被打成按钮 3。
+        assert_eq!(
+            encode_mouse_report(0, 0, 2, false, mods, mode),
+            Some(b"\x1b[<2;1;1m".to_vec())
+        );
+    }
+
+    #[test]
+    fn sgr_mouse_release_keeps_modifier_bits_on_the_real_button() {
+        let mode = TermMode::SGR_MOUSE;
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..gpui::Modifiers::none()
+        };
+
+        // ctrl = +16，左键松开应为 16，而不是规范外的 3+16=19。
+        assert_eq!(
+            encode_mouse_report(0, 0, 0, false, ctrl, mode),
+            Some(b"\x1b[<16;1;1m".to_vec())
+        );
     }
 
     fn cell(ch: char) -> CellSnapshot {

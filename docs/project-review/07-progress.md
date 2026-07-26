@@ -214,7 +214,44 @@
   fallback 表，首帧到换装之间罕见符号（Nerd Font 图标等）可能短暂用
   保守表渲染。
 
-## 下一步
+## 阶段 5 · 结构与工程化收尾 —— 已完成
 
-阶段 5（结构与工程化收尾）：ARCH-3 字段分组、SEC-4 debug server 生命周期、
-ENG-8~13 文档与工程化、ENG-3 future-incompat 评估。
+| 条目 | 状态 | 提交 |
+|---|---|---|
+| ARCH-3 字段分组（CursorSlide / LatencyDiagnostics / SelectionState / InputLineMirror） | 已修 | `7ae66d4` |
+| SEC-4 debug server 进程级单实例 + per-tab 路由 + Drop 注销 | 已修 | `e470104` |
+| ENG-8 重写 TODO.md | 已修 | `2244c85` |
+| ENG-9 README（行数表 / debug 端点 / 限制清单 / License） | 已修 | `2244c85` |
+| ENG-10 VENDOR.md 对齐现状 | 已修 | `2244c85` |
+| ENG-11 TERM_PROGRAM 统一 + codesign 步骤 | 已修 | `2244c85` |
+| ENG-12 LICENSE + THIRD-PARTY-NOTICES | 已修 | `2244c85` |
+| ENG-13 IMPROVEMENT_PLAN / api-system-plan 更新 | 已修 | `2244c85` |
+| ENG-3 block v0.1.6 评估（结论：上游约束，本仓库不可修） | 已评估 | `2244c85` |
+
+### 验收记录
+
+- `scripts/check.sh` 全绿；主 crate 测试 **142 → 145**（input_mirror 新增 3），
+  workspace 合计 **327**。
+- SEC-4 端到端验证：`/debug/tabs` 列表、`/debug/tabs/1/input` 注入抵达 shell、
+  旧路径兼容、不存在的 tab 返回 404。
+- 四个子 struct 共收拢 20 个顶层字段且全部私有；影子输入行（产品论点根基）
+  首次获得纯函数测试覆盖。
+
+### 遗留与偏差
+
+- **ARCH-3 未达到"约 25 字段"的目标数**：计划点名的四组已全部收拢，但
+  AgentTerminal 顶层仍有约 40 个字段（字体组、订阅句柄组、PTY 句柄组等
+  计划未点名的部分）。继续分组是同一模式的重复劳动，边际收益递减，未擅自扩大。
+- **SEC-4 的旧路径兼容**路由到编号最小的存活 tab——多 tab 下旧脚本的行为
+  从"打到自己 tab 的端口"变成"打到第一个 tab"。迁移到 `/debug/tabs/{id}/...`
+  即可精确指定；这是单实例化的必然取舍。
+- codesign 无证书时是 ad-hoc 兜底：签名合法但 CDHash 每次构建变化，
+  AX 授权仍会在重建后失效。根治需要用户配置 CODESIGN_IDENTITY。
+
+## 总结（2026-07-26 修复轮收官）
+
+审查登记 51 项缺陷：**S0 4/4、S1 3/3、S2 21/22、S3 17/22 已修**，其余为：
+DSP-10（行为取舍，刻意不做）、COR-10 与 ARCH-1（战略决策项，见工作计划第四节）、
+ENG-3（上游约束）、ENG-1（缓解完成，根治需 fork 决策）。
+测试规模 91 → 327；clippy -D warnings 门槛全绿；CI 与补丁校验兜底可复现性。
+详细对照以各阶段小节为准。

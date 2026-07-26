@@ -130,6 +130,8 @@ pub(crate) struct RenderPalette {
     pub(crate) title_fg: Hsla,
     pub(crate) selection_bg: Hsla,
     pub(crate) cursor_bg: Hsla,
+    /// 默认前景色，IME 组合文本等"不属于任何 cell"的文字用它（DSP-9）。
+    pub(crate) foreground: Hsla,
 }
 
 struct TerminalCanvasPrepaint {
@@ -145,6 +147,7 @@ pub(crate) fn palette_for(theme: Theme) -> RenderPalette {
             title_fg: rgb(0xa9b1c6).into(),
             selection_bg: rgba(0x4b93ffaa).into(),
             cursor_bg: rgba(0xffea00a6).into(),
+            foreground: rgb(0xd7dae0).into(),
         },
         Theme::EyeCare => RenderPalette {
             app_bg: rgb(0x151b17).into(),
@@ -153,6 +156,7 @@ pub(crate) fn palette_for(theme: Theme) -> RenderPalette {
             title_fg: rgb(0xc0cbbd).into(),
             selection_bg: rgba(0x7ca67899).into(),
             cursor_bg: rgba(0xffea00a6).into(),
+            foreground: rgb(0xccd6c8).into(),
         },
     }
 }
@@ -188,7 +192,10 @@ impl Render for AgentTerminal {
         let selection = self.selection_bounds();
         let input_mode = self.convenience_state.input_mode();
         let palette = palette_for(self.theme);
-        let cursor_bg = cursor_color_for_focus(palette.cursor_bg, input_mode, window_active);
+        // 灰化判据是"终端失焦"而不只是"窗口失活"（DSP-15）：同窗口内焦点转移
+        //（tab 重命名框等）也应让光标变灰。
+        let cursor_bg =
+            cursor_color_for_focus(palette.cursor_bg, input_mode, window_active && focused);
         let terminal_title = self
             .terminal_title
             .lock()
@@ -251,7 +258,8 @@ impl Render for AgentTerminal {
                         let run_template = gpui::TextRun {
                             len: 0,
                             font: mono.clone(),
-                            color: rgb(0xd7dae0).into(),
+                            // IME 组合文本走这个默认色，随主题（DSP-9）。
+                            color: palette.foreground,
                             background_color: None,
                             underline: None,
                             strikethrough: None,
@@ -469,10 +477,20 @@ impl Render for AgentTerminal {
                                 origin.x + (cursor_visual_col + cursor_extra_cols) * cell_width,
                                 origin.y + cursor_visual_row as f32 * line_height,
                             );
-                            let cell_width_px = cell_width.max(px(2.0));
+                            let single_cell_width_px = cell_width.max(px(2.0));
+                            // Block/Underline/HollowBlock 覆盖光标所在 cell 的全部
+                            // 列宽（DSP-8）：停在 CJK/emoji 上要盖两格，不是左半格。
+                            // Beam 是插入点，粗细仍按单格算。
+                            let cursor_width_cols = snapshot
+                                .cells
+                                .get(cursor_visual_row)
+                                .and_then(|row| row.get(cursor_logical_col_floor))
+                                .map(|cell| f32::from(cell.width_cols.max(1)))
+                                .unwrap_or(1.0);
+                            let cell_width_px = single_cell_width_px * cursor_width_cols;
                             match cursor_shape {
                                 CursorShape::Beam => {
-                                    let beam_width = (cell_width_px * 0.14).max(px(2.0));
+                                    let beam_width = (single_cell_width_px * 0.14).max(px(2.0));
                                     if cursor_trail_enabled && cursor_sliding {
                                         let delta_cols = cursor_visual_col - cursor_anim_from_col;
                                         if delta_cols.abs() > f32::EPSILON {
@@ -480,7 +498,8 @@ impl Render for AgentTerminal {
                                                 CURSOR_TRAIL_MIN_LEN_CELLS,
                                                 CURSOR_TRAIL_MAX_LEN_CELLS,
                                             );
-                                            let primary_trail_width = cell_width_px * trail_cells;
+                                            let primary_trail_width =
+                                                single_cell_width_px * trail_cells;
                                             let primary_trail_origin_x =
                                                 if delta_cols.is_sign_positive() {
                                                     cursor_origin.x - primary_trail_width
@@ -502,7 +521,7 @@ impl Render for AgentTerminal {
                                             let secondary_trail_width = (primary_trail_width
                                                 * CURSOR_TRAIL_SECONDARY_LEN_SCALE)
                                                 .min(
-                                                    cell_width_px
+                                                    single_cell_width_px
                                                         * (CURSOR_TRAIL_MAX_LEN_CELLS * 1.8),
                                                 );
                                             let secondary_trail_origin_x =

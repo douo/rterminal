@@ -1,7 +1,7 @@
 use gpui::{
     ClipboardItem, Context, FocusHandle, FontFallbacks, FontStyle, FontWeight, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta,
-    ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px, rgb, size,
+    ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px, size,
 };
 
 use crate::cli::Theme;
@@ -319,7 +319,7 @@ impl Render for SnapshotTab {
                         let run_template = gpui::TextRun {
                             len: 0,
                             font: mono.clone(),
-                            color: rgb(0xd7dae0).into(),
+                            color: palette.foreground,
                             background_color: None,
                             underline: None,
                             strikethrough: None,

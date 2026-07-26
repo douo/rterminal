@@ -115,11 +115,19 @@ pub(crate) fn snapshot_cell(
         return None;
     }
 
-    let mut fg = cell.fg;
-    let mut bg = cell.bg;
-    if cell.flags.contains(Flags::INVERSE) {
-        std::mem::swap(&mut fg, &mut bg);
-    }
+    // INVERSE 交换的是**解析后**的颜色（DSP-7）：BOLD/DIM 变体属于"文本色"，
+    // 要先施加到前景上、再随交换搬到背景去。此前先交换原始 AnsiColor 再解析，
+    // 亮/暗变体被错误地施加到原背景色上——`\e[1;7;31m` 的反色块应为亮红背景，
+    // 实际渲染成普通红。
+    let resolved_fg = ansi_to_hsla(cell.fg, colors, cell.flags, true);
+    let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
+        (
+            ansi_to_hsla(cell.bg, colors, Flags::empty(), false),
+            Some(resolved_fg),
+        )
+    } else {
+        (resolved_fg, ansi_bg_to_hsla(cell.bg, colors))
+    };
 
     let ch = if cell.flags.contains(Flags::HIDDEN) {
         ' '
@@ -143,8 +151,8 @@ pub(crate) fn snapshot_cell(
     Some(CellSnapshot {
         ch,
         zerowidth,
-        fg: ansi_to_hsla(fg, colors, cell.flags, true),
-        bg: ansi_bg_to_hsla(bg, colors),
+        fg,
+        bg,
         link: cell.hyperlink().map(|link| link.uri().to_string()),
         bold,
         italic,
@@ -573,7 +581,60 @@ mod tests {
         };
         let snap = snapshot_cell(&inverse, &colors, &forced).expect("inverse cell is content");
         // INVERSE 交换后：原背景成为前景、红色成为背景。
-        assert!(snap.bg.is_some());
+        assert_eq!(
+            snap.bg,
+            Some(ansi_to_hsla(
+                AnsiColor::Named(NamedColor::Red),
+                &colors,
+                Flags::empty(),
+                true
+            ))
+        );
+    }
+
+    /// 回归（DSP-7）：BOLD 的亮色变体先落到前景、再随 INVERSE 交换搬到背景——
+    /// `\e[1;7;31m` 的反色块是**亮红**背景，不是普通红。
+    #[test]
+    fn inverse_swaps_resolved_colors_after_bold_variant() {
+        use alacritty_terminal::term::cell::Cell;
+        use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+
+        let colors = Colors::default();
+        let forced = HashSet::new();
+
+        let cell = Cell {
+            c: 'z',
+            fg: AnsiColor::Named(NamedColor::Red),
+            bg: AnsiColor::Named(NamedColor::Background),
+            flags: Flags::INVERSE | Flags::BOLD,
+            ..Cell::default()
+        };
+        let snap = snapshot_cell(&cell, &colors, &forced).expect("content cell");
+
+        let bright_red = ansi_to_hsla(
+            AnsiColor::Named(NamedColor::Red),
+            &colors,
+            Flags::BOLD,
+            true,
+        );
+        let plain_red = ansi_to_hsla(
+            AnsiColor::Named(NamedColor::Red),
+            &colors,
+            Flags::empty(),
+            true,
+        );
+        assert_eq!(snap.bg, Some(bright_red));
+        assert_ne!(snap.bg, Some(plain_red));
+        // 前景拿到的是解析后的默认背景色，不带任何变体。
+        assert_eq!(
+            snap.fg,
+            ansi_to_hsla(
+                AnsiColor::Named(NamedColor::Background),
+                &colors,
+                Flags::empty(),
+                false
+            )
+        );
     }
 
     #[test]

@@ -28,7 +28,8 @@ fn ansi_to_rgb(
     match color {
         AnsiColor::Spec(rgb) => {
             let mut value = (rgb.r, rgb.g, rgb.b);
-            if is_foreground && flags.contains(Flags::DIM) && !flags.contains(Flags::BOLD) {
+            // DIM 对 BOLD+DIM 同样生效（DSP-5）：alacritty 把两者并存按 DIM 处理。
+            if is_foreground && flags.contains(Flags::DIM) {
                 value = dim_rgb(value);
             }
             value
@@ -36,7 +37,40 @@ fn ansi_to_rgb(
         AnsiColor::Named(named) => {
             named_to_rgb(named_color_variant(named, flags, is_foreground), colors)
         }
-        AnsiColor::Indexed(index) => indexed_to_rgb(index, colors),
+        AnsiColor::Indexed(index) => indexed_fg_to_rgb(index, colors, flags, is_foreground),
+    }
+}
+
+/// Indexed 前景色的 DIM 语义（DSP-6），对齐 alacritty：
+/// 亮色 8–15 变暗回落到 0–7，标准色 0–7 落到专门的 Dim 变体，256 色其余不变。
+/// 此前 `\e[38;5;1m\e[2m` 完全不变暗，与 `Spec`/`Named` 分支行为不一致。
+fn indexed_fg_to_rgb(
+    index: u8,
+    colors: &Colors,
+    flags: Flags,
+    is_foreground: bool,
+) -> (u8, u8, u8) {
+    if !is_foreground || !flags.contains(Flags::DIM) {
+        return indexed_to_rgb(index, colors);
+    }
+
+    match index {
+        8..=15 => indexed_to_rgb(index - 8, colors),
+        0..=7 => named_to_rgb(dim_variant_of_standard_index(index), colors),
+        _ => indexed_to_rgb(index, colors),
+    }
+}
+
+fn dim_variant_of_standard_index(index: u8) -> NamedColor {
+    match index {
+        0 => NamedColor::DimBlack,
+        1 => NamedColor::DimRed,
+        2 => NamedColor::DimGreen,
+        3 => NamedColor::DimYellow,
+        4 => NamedColor::DimBlue,
+        5 => NamedColor::DimMagenta,
+        6 => NamedColor::DimCyan,
+        _ => NamedColor::DimWhite,
     }
 }
 
@@ -52,7 +86,8 @@ fn named_color_variant(named: NamedColor, flags: Flags, is_foreground: bool) -> 
     ) {
         (true, false, NamedColor::Foreground) => NamedColor::BrightForeground,
         (true, false, value) => value.to_bright(),
-        (false, true, value) => value.to_dim(),
+        // DIM 压过 BOLD+DIM（DSP-5）：此前落进兜底分支返回原色。
+        (_, true, value) => value.to_dim(),
         _ => named,
     }
 }
@@ -144,4 +179,75 @@ fn dim_rgb((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
         ((g as f32) * 0.66) as u8,
         ((b as f32) * 0.66) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::vte::ansi::Rgb;
+
+    fn hsla(color: AnsiColor, flags: Flags) -> gpui::Hsla {
+        ansi_to_hsla(color, &Colors::default(), flags, true)
+    }
+
+    /// 回归（DSP-5）：BOLD+DIM 并存按 DIM 处理（对齐 alacritty），不再返回原色。
+    #[test]
+    fn bold_dim_named_color_resolves_to_dim_variant() {
+        let bold_dim = hsla(AnsiColor::Named(NamedColor::Red), Flags::BOLD | Flags::DIM);
+        let dim = hsla(AnsiColor::Named(NamedColor::Red), Flags::DIM);
+        let plain = hsla(AnsiColor::Named(NamedColor::Red), Flags::empty());
+
+        assert_eq!(bold_dim, dim);
+        assert_ne!(bold_dim, plain);
+    }
+
+    /// 回归（DSP-5）：Spec 真彩色的 DIM 同样压过 BOLD。
+    #[test]
+    fn bold_dim_spec_color_is_dimmed() {
+        let spec = AnsiColor::Spec(Rgb {
+            r: 200,
+            g: 100,
+            b: 50,
+        });
+        assert_eq!(hsla(spec, Flags::BOLD | Flags::DIM), hsla(spec, Flags::DIM));
+        assert_ne!(
+            hsla(spec, Flags::BOLD | Flags::DIM),
+            hsla(spec, Flags::empty())
+        );
+    }
+
+    /// 回归（DSP-6）：Indexed 前景不再忽略 DIM——标准色落 Dim 变体、亮色回落基色。
+    #[test]
+    fn indexed_foreground_honors_dim() {
+        let dim_red = hsla(AnsiColor::Indexed(1), Flags::DIM);
+        let named_dim_red = hsla(AnsiColor::Named(NamedColor::DimRed), Flags::empty());
+        assert_eq!(dim_red, named_dim_red);
+
+        let dim_bright_red = hsla(AnsiColor::Indexed(9), Flags::DIM);
+        let plain_red = hsla(AnsiColor::Indexed(1), Flags::empty());
+        assert_eq!(dim_bright_red, plain_red);
+
+        // 256 色区间不做变暗（对齐 alacritty）。
+        assert_eq!(
+            hsla(AnsiColor::Indexed(120), Flags::DIM),
+            hsla(AnsiColor::Indexed(120), Flags::empty())
+        );
+    }
+
+    /// 背景色不受 DIM/BOLD 变体影响。
+    #[test]
+    fn background_ignores_dim_and_bold() {
+        let colors = Colors::default();
+        let bg = ansi_bg_to_hsla(AnsiColor::Indexed(1), &colors);
+        assert!(bg.is_some());
+        assert_eq!(
+            bg,
+            Some(ansi_to_hsla(
+                AnsiColor::Indexed(1),
+                &colors,
+                Flags::empty(),
+                false
+            ))
+        );
+    }
 }

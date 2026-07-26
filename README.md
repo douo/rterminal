@@ -60,19 +60,22 @@ This is **not** intended to be a general-purpose terminal replacement. It is an 
 
 | File | Lines | Responsibility |
 |------|------:|----------------|
-| `terminal.rs` | ~1100 | Core terminal state: PTY lifecycle, `Term` wiring, snapshot generation, cursor animation |
-| `input.rs` | ~1600 | Keyboard/mouse/IME/paste handling, input-line shadow model, AX override logic, selection |
-| `render.rs` | ~510 | GPUI `Render` impl, per-cell canvas painting, cursor drawing, AX sync entry point |
-| `keyboard.rs` | ~300 | Keystroke-to-terminal-byte encoding (special keys, Ctrl chords, Alt, modifiers) |
-| `tabs.rs` | ~470 | Multi-tab management, tab bar rendering, Cmd+N shortcuts |
-| `snapshot_tab.rs` | ~540 | Read-only snapshot tabs with scrollback, selection, copy |
+| `terminal.rs` | ~2050 | Core terminal state: PTY lifecycle, `Term` wiring, snapshot generation, sub-state structs (cursor slide, latency, selection) |
+| `input.rs` | ~1950 | Keyboard/mouse/IME/paste handling, AX override logic, selection gestures |
+| `debug_server.rs` | ~1110 | Process-level HTTP debug API with per-tab routing (`/debug/tabs/{id}/...`), auth, tests |
+| `keyboard.rs` | ~940 | Keystroke-to-terminal-byte encoding (special keys, Ctrl table, Alt, kitty protocol) |
+| `render.rs` | ~890 | GPUI `Render` impl (read-only), run-merged text shaping, cursor drawing |
+| `grid_cells.rs` | ~660 | Single home for cell semantics: snapshot conversion, column widths, selection extraction |
+| `tabs.rs` | ~600 | Multi-tab management, tab bar rendering, Cmd+N shortcuts |
+| `snapshot_tab.rs` | ~450 | Read-only snapshot tabs with scrollback, selection, copy |
+| `font_fallback.rs` | ~350 | Background system-font scan scoring CJK/emoji/symbol coverage for fallbacks |
+| `pty.rs` | ~290 | PTY creation via `portable-pty`, reader thread (EINTR-safe), dedicated writer thread |
+| `color.rs` | ~250 | ANSI → HSLA color mapping (named, indexed 256, dim/bright, spec RGB) |
+| `input_mirror.rs` | ~240 | Shadow input-line model: the AX-published line/cursor, mutated only via methods |
+| `cli.rs` | ~215 | CLI argument parsing via `clap` |
+| `text_utils.rs` | ~190 | UTF-16 ↔ byte index conversion, word deletion, AX override heuristics |
 | `macos_ax.rs` | ~140 | Native Objective-C bridge: `setAccessibilityValue` / `setAccessibilitySelectedTextRange` |
-| `debug_server.rs` | ~520 | HTTP debug API (`/debug/state`, `/debug/screen`, `/debug/input`, `/debug/replace-line`) |
-| `text_utils.rs` | ~180 | UTF-16 ↔ byte index conversion, word deletion, AX override heuristics |
-| `pty.rs` | ~85 | PTY creation via `portable-pty`, background reader thread |
-| `color.rs` | ~150 | ANSI → HSLA color mapping (named, indexed 256, dim/bright, spec RGB) |
-| `cli.rs` | ~170 | CLI argument parsing via `clap` |
-| `input_log.rs` | ~85 | Structured JSONL input event logger for debugging |
+| `input_log.rs` | ~100 | Structured JSONL input event logger for debugging |
 
 ## Features
 
@@ -136,14 +139,18 @@ curl -H "X-Debug-Token: $TOKEN" http://127.0.0.1:37878/debug/state
 
 | Endpoint | Description |
 |---|---|
-| `GET /debug/state` | JSON snapshot of terminal state, counters, uptime |
-| `GET /debug/screen` | Plain-text dump of visible terminal content |
-| `POST /debug/input` | Inject raw bytes into the PTY |
-| `POST /debug/replace-line` | Replace the current shell input line |
+| `GET /debug/tabs` | List live tab sessions and their per-tab endpoints |
+| `GET /debug/tabs/{id}/state` | JSON snapshot of that tab's state, counters, uptime |
+| `GET /debug/tabs/{id}/screen` | Plain-text dump of that tab's visible content |
+| `POST /debug/tabs/{id}/input` | Inject raw bytes into that tab's PTY |
+| `POST /debug/tabs/{id}/replace-line` | Replace that tab's current shell input line |
+| `GET/POST /debug/{state,screen,input,replace-line}` | Legacy paths; route to the lowest-numbered live tab |
 
 Guarantees the server enforces:
 
-- Listens on `127.0.0.1:37878-37977` only (one port per tab).
+- One server per process on `127.0.0.1:37878-37977`; tabs register sessions and
+  unregister automatically when closed (a closed tab's endpoints return 404,
+  injection can never reach a dead session).
 - Requires the token on **all** endpoints — the read endpoints return your screen contents,
   which is as sensitive as write access.
 - Requires a loopback `Host` header, which blocks DNS rebinding.
@@ -292,15 +299,22 @@ Both matter when deciding what to type into this terminal.
 ## Known Limitations
 
 - **macOS only** — GPUI's platform layer currently targets macOS; Linux/Windows support depends on upstream
-- **Per-cell text shaping** — rendering shapes each character individually rather than batching runs per line; functional but not optimal for performance (see `docs/project-review/` PERF-1)
-- **Input-line model drift** — the shadow `input_line` can desynchronize from the actual shell state in complex scenarios (tmux prefix sequences, shell history navigation, tab completion)
-- **No scrollback UI** — `Cmd+Shift+S` opens a read-only snapshot tab of the current buffer, but the main screen has no scroll-wheel history yet
+- **Input-line model drift** — the shadow `input_line` can desynchronize from the actual shell state in complex scenarios (shell history navigation, tab completion, `Ctrl-R`); byte-sniffing is a heuristic by construction. The real fix is shell-side reporting (OSC 133 / ZLE hooks) — see strategic decision 1 in `docs/project-review/06-work-plan.md`
+- **No scrollback UI** — `Cmd+Shift+S` opens a read-only snapshot tab of the current buffer, but the main screen has no scroll-wheel history (see strategic decision 2; requires fixing ARCH-1 first)
 - **No search** — no find-in-terminal functionality
-- **No bold/italic font variants** — text style flags are parsed but not rendered with distinct font faces
 - **Kitty keyboard physical-layout detail** — runtime mode negotiation and
   CSI-u event encoding are supported, but alternate layout key reporting is
   limited by GPUI's logical keystroke data
+- **Rebuilds reset the Accessibility grant unless you codesign** — TCC remembers
+  authorization by code signature; set `CODESIGN_IDENTITY` when running
+  `scripts/build-macos-app.sh` to keep it across rebuilds (ad-hoc fallback signs
+  validly but with a per-build hash)
+- **`block v0.1.6` future-incompat** — pulled in via `cocoa`/gpui; will be rejected
+  by a future Rust release. Unfixable here until zed migrates to objc2; pinned
+  toolchain (1.95.0) masks it for now
 
 ## License
 
-This project is currently private and unlicensed.
+Private, all rights reserved — see [LICENSE](LICENSE). Build artifacts statically
+link Apache-2.0 code (alacritty_terminal, gpui); if a bundle is ever distributed
+it must carry [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

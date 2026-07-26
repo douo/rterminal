@@ -321,7 +321,10 @@ Manual validation:
 
 - Should `/api/v1/screen` default to full visible lines or default `tail=200`?
 - Should `with_control=true` return escaped text only in v1, or require raw PTY reconstruction immediately?
-- Should write APIs be token-protected by default or opt-in?
+- ~~Should write APIs be token-protected by default or opt-in?~~ **已定：默认必须带 token，
+  且读端点同样要认证**（读接口会带回整屏文本，泄露面与写接口等同）。这是 SEC-1 的
+  教训——现有 debug HTTP 已按此实现（`--debug-http` 显式开启 + 强制 `X-Debug-Token` +
+  Host 校验），未来的正式 API 不得低于这条基线。
 
 ## 12. Suggested First Delivery Scope
 

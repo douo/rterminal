@@ -51,7 +51,9 @@ set -eu
 
 TERM=xterm-256color
 COLORTERM=truecolor
-TERM_PROGRAM=agent_terminal
+# 与 src/pty.rs 保持一致（ENG-11）：pty.rs 对每个 shell 都会设 TERM_PROGRAM=rterminal，
+# 这里若写别的名字，下游工具的探测结果就会随启动方式变化。
+TERM_PROGRAM=rterminal
 : "${LANG:=en_US.UTF-8}"
 : "${LC_CTYPE:=en_US.UTF-8}"
 
@@ -95,6 +97,15 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# 签名（ENG-11）。本应用需要辅助功能（AX）权限，而 TCC 按代码签名记住授权：
+# - 设置 CODESIGN_IDENTITY 为真实证书（如 "Apple Development: ..."）时，签名的
+#   designated requirement 稳定，重建后 AX 授权保留；
+# - 未设置时退化为 ad-hoc 签名（`-`）：签名合法但 CDHash 每次构建都变，
+#   重建后仍需重新授权 AX——这是没有证书时的已知限制，不是 bug。
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+echo "Codesigning with identity: $CODESIGN_IDENTITY"
+codesign --force --deep --sign "$CODESIGN_IDENTITY" --identifier "$APP_ID" "$APP_DIR"
 
 echo "Built app bundle:"
 echo "  $APP_DIR"

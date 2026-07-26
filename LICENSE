@@ -1,0 +1,9 @@
+Copyright (c) 2026 tiou. All rights reserved.
+
+This is a private, unlicensed project. No permission is granted to use,
+copy, modify, or distribute this software or any part of it.
+
+Third-party components bundled with or statically linked into build
+artifacts retain their own licenses; see THIRD-PARTY-NOTICES.md. If a
+build artifact (such as the macOS .app bundle) is ever distributed,
+the third-party license texts and notices listed there must accompany it.

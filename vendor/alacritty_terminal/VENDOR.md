@@ -11,11 +11,11 @@
 
 ## 相对上游改了什么
 
-只有一处功能性 fork，4 个文件 +481/-3：
+只有一处功能性 fork，4 个文件：
 
 | 文件 | 改动 |
 |---|---|
-| `src/sixel.rs` | **新增**（约 420 行）。上游 0.25.1 无 SIXEL 支持，这个解码器是本项目写的 |
+| `src/sixel.rs` | **新增**（约 470 行）。上游 0.25.1 无 SIXEL 支持，这个解码器是本项目写的。2026-07-26 补 `mark_column`（空列计入宽度，DSP-11）与对应测试 |
 | `src/lib.rs` | +1 行 `pub mod sixel;` |
 | `src/event.rs` | +24 行，新增 SIXEL 相关事件（含 `Event::Erase`） |
 | `src/term/mod.rs` | +39/-3，接入 SIXEL 处理与颜色修正 |
@@ -51,6 +51,8 @@
 
 ## 已知待办
 
-- `src/sixel.rs` 与三处接缝零上游侧测试（上面第 5 点）。
-- 见 `docs/project-review/05-bug-ledger.md` 中 DSP-1/DSP-2/DSP-10/DSP-11：`swap_alt`
-  不发 `Event::Erase`、`EL` 清行粒度过粗、SIXEL 空列不计入 `max_x` 等，都落在这棵树里。
+- 三处接缝（`lib.rs` / `event.rs` / `term/mod.rs`）零上游侧测试（上面第 5 点）；
+  `src/sixel.rs` 本身已有 4 个解码测试。
+- DSP-10（`EL` 清行对整行发 Erase、图片"相交即整删"）仍在这棵树里，属行为取舍，
+  未排期（见 `docs/project-review/07-progress.md` 阶段 3 遗留）。
+  DSP-1/DSP-2/DSP-11 已在 2026-07-26 修复（DSP-1/2 在主 crate 侧，DSP-11 在本树）。

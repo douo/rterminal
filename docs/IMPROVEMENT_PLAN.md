@@ -19,17 +19,25 @@
 - [x] 收敛输入模块中明显重复包装函数（保持 API 兼容）。
 - 验证：阶段 0 全量 + 行为回归测试。
 
-## 阶段 3：Debug Server 生命周期治理（待开始）
-- [ ] 设计并实现单实例 debug server + 会话路由（或同等泄漏治理方案）。
-- [ ] 明确 tab 创建/销毁与 debug 会话注册/注销关系。
-- [ ] 覆盖多 tab 开关后的端口与可用性回归测试。
-- 验证：阶段 0 全量 + 新增 debug 生命周期测试。
+## 阶段 3：Debug Server 生命周期治理（已完成，并入项目审查阶段 5 的 SEC-4）
+- [x] 单实例 debug server + 会话路由：进程级 `DebugTabRegistry` + 单 server 线程，
+      路由 `/debug/tabs/{id}/...`，旧路径兼容映射到首个存活 tab。
+- [x] tab 创建时经 `register_debug_http_tab` 注册，`DebugTabHandle` 随
+      `AgentTerminal` Drop 自动注销。
+- [x] 端到端验证多 tab 路由与已关闭 tab 的 404 行为（见
+      `docs/project-review/07-progress.md` 阶段 5）。
 
 ## 里程碑验收标准
 1. 不引入功能回退（现有自动化测试持续通过）。
 2. 每阶段结束至少完成一次全量验证并记录结果。
 3. 对每个线上问题修复，至少增加一个能复现/防回归的测试点。
 
+> 本计划已由 `docs/project-review/06-work-plan.md`（2026-07-26 的全面审查工作计划）
+> 吸收并替代；后续进度看 `docs/project-review/07-progress.md`。
+
 ## 当前验证记录
 - 2026-03-13：阶段 0 + 阶段 1 + 阶段 2（部分）完成后，`cargo check` / `cargo test`（15 tests）/ `cargo clippy --all-targets -- -D warnings` 全部通过。
 - 2026-03-13：阶段 2 全量完成后，再次通过 `cargo check` / `cargo test`（15 tests）/ `cargo clippy --all-targets -- -D warnings` / `cargo run -- --self-check`。
+- 2026-07-26：项目审查阶段 0–5 完成后，`scripts/check.sh`（fmt + clippy -D warnings +
+  workspace 全量测试 + self-check）全绿；测试规模 15 → **327**（主 crate 145 +
+  vendored 136/45/1）。历史记录中的"15 tests"停留在模块拆分之前，勿再引用。

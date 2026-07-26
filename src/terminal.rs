@@ -600,6 +600,13 @@ impl AgentTerminal {
                 let _ = this.update(cx, |this, cx| {
                     this.shell_exited = true;
                     this.debug.set_note(Some("shell exited".to_string()));
+                    // shell 自己退出（用户输入 exit）而 tab 还开着时，也要收尸，
+                    // 否则它就一直是僵尸。用 try_wait 而不是 wait：这里在 UI 线程上，
+                    // 而"channel 关闭"并不百分百等于"进程已退出"（例如 reader 侧
+                    // 因为读错误提前收摊）。
+                    if let Some(child) = &this.child {
+                        let _ = child.lock().try_wait();
+                    }
                     cx.emit(TerminalExitedEvent);
                     cx.notify();
                 });
@@ -1412,7 +1419,11 @@ impl EventEmitter<TerminalExitedEvent> for AgentTerminal {}
 impl Drop for AgentTerminal {
     fn drop(&mut self) {
         if let Some(child) = &self.child {
-            let _ = child.lock().kill();
+            let mut child = child.lock();
+            let _ = child.kill();
+            // kill 之后必须 wait：否则子进程以僵尸形式挂在进程表里直到 app 退出。
+            // 反复开关 tab 会一个个攒起来。
+            let _ = child.wait();
         }
     }
 }

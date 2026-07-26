@@ -62,13 +62,24 @@ impl PtySession {
             let mut buf = vec![0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
+                    // 真正的 EOF：子进程关掉了它那一端。
                     Ok(0) => break,
                     Ok(read) => {
                         if tx.send_blocking(buf[..read].to_vec()).is_err() {
+                            // 接收端已经没了（tab 关闭），正常收摊。
                             break;
                         }
                     }
-                    Err(_) => break,
+                    // `Read::read` 不会自己重试 EINTR。原来这里和其它错误一样直接 break，
+                    // 于是一次信号打断就会让 reader 线程退出、channel 关闭，而 pump 任务
+                    // 把 channel 关闭当成 "shell exited" —— shell 其实还活着，终端却
+                    // 永久失去了输出。
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        // 原来是 `Err(_) => break`：PTY 异常断开完全静默，没法排障。
+                        eprintln!("pty reader stopped: {err}");
+                        break;
+                    }
                 }
             }
         });

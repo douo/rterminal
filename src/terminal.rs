@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,7 +34,7 @@ use crate::font_fallback::font_fallback_families;
 use crate::input::{ExternalFileDragState, FocusActivationMouseGuard};
 use crate::input_log::InputLogger;
 use crate::keyboard::encode_keystroke;
-use crate::pty::{PtySession, SharedPtyWriter, write_to_pty};
+use crate::pty::{PtySession, PtyWriteHandle};
 use crate::render::{
     CUSTOM_TITLE_BAR_HEIGHT, STATUS_BAR_HEIGHT, TEXT_PADDING_X, TEXT_PADDING_Y, line_height_for,
     measure_cell_width,
@@ -125,7 +124,7 @@ enum PendingTerminalEvent {
 #[derive(Clone)]
 pub(crate) struct TitleTrackingListener {
     pub(crate) title: Arc<Mutex<Option<String>>>,
-    pub(crate) writer: Option<SharedPtyWriter>,
+    pub(crate) writer: Option<PtyWriteHandle>,
     pending_events: Arc<Mutex<Vec<PendingTerminalEvent>>>,
 }
 
@@ -140,7 +139,7 @@ impl EventListener for TitleTrackingListener {
             }
             AlacTermEvent::PtyWrite(text) => {
                 if let Some(writer) = &self.writer {
-                    let _ = write_to_pty(writer, text.as_bytes());
+                    writer.write(text.as_bytes());
                 }
             }
             AlacTermEvent::ClipboardStore(clipboard, text) => {
@@ -302,7 +301,7 @@ pub(crate) struct AgentTerminal {
     pub(crate) cell_width: Pixels,
     pty_pixel_size: PtyPixelSize,
     pub(crate) master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
-    pub(crate) writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    pub(crate) writer: Option<PtyWriteHandle>,
     pub(crate) child: Option<Arc<Mutex<Box<dyn Child + Send>>>>,
     pub(crate) input_line: String,
     pub(crate) input_cursor_utf16: usize,
@@ -399,7 +398,8 @@ impl AgentTerminal {
                 (
                     shell,
                     Some(session.master),
-                    Some(session.writer),
+                    // 起专职写线程，之后所有写入都是投递，不在 UI 线程上阻塞。
+                    Some(PtyWriteHandle::spawn(session.writer)),
                     Some(session.child),
                     Some(session.output_rx),
                     debug,
@@ -1020,14 +1020,13 @@ impl AgentTerminal {
             return;
         };
 
-        match write_to_pty(writer, bytes) {
-            Ok(()) => {
-                self.debug.record_bytes_to_pty(bytes.len(), false);
-            }
-            Err(err) => {
-                self.debug
-                    .set_error(format!("failed to write input: {err:#}"));
-            }
+        // 投递即返回：真正的 write_all/flush 在专职写线程上，UI 线程不会被
+        // "前台程序不读 stdin" 拖死。
+        if writer.write(bytes) {
+            self.debug.record_bytes_to_pty(bytes.len(), false);
+        } else {
+            self.debug
+                .set_error("failed to enqueue input for the PTY writer");
         }
     }
 
@@ -1703,12 +1702,27 @@ mod tests {
         }
     }
 
-    fn recording_writer() -> (SharedPtyWriter, Arc<Mutex<Vec<u8>>>) {
+    fn recording_writer() -> (PtyWriteHandle, Arc<Mutex<Vec<u8>>>) {
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        let writer: SharedPtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        let writer: crate::pty::SharedPtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
             bytes: bytes.clone(),
         })));
-        (writer, bytes)
+        (PtyWriteHandle::spawn(writer), bytes)
+    }
+
+    /// 写入现在是投递到专职线程，断言必须等它落地（见 ROB-2）。
+    fn wait_for_written_bytes(recorded: &Arc<Mutex<Vec<u8>>>, expected: &[u8]) {
+        for _ in 0..200 {
+            if recorded.lock().as_slice() == expected {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "expected {:?} to be written to the PTY, got {:?}",
+            expected,
+            recorded.lock()
+        );
     }
 
     #[test]
@@ -1730,7 +1744,7 @@ mod tests {
         processor.advance(&mut term, b"abc");
         processor.advance(&mut term, b"\x1b[6n");
 
-        assert_eq!(&*bytes.lock(), b"\x1b[1;4R");
+        wait_for_written_bytes(&bytes, b"\x1b[1;4R");
     }
 
     #[test]
@@ -1807,6 +1821,8 @@ mod tests {
 
         processor.advance(&mut term, b"\x1b[?u");
 
+        // 反向断言：给写线程一点时间，确认确实什么都没写出去。
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(bytes.lock().is_empty());
         assert!(!term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
     }
@@ -1883,7 +1899,7 @@ mod tests {
         processor.advance(&mut term, b"\x1b[?u");
 
         assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
-        assert_eq!(&*bytes.lock(), b"\x1b[?1u");
+        wait_for_written_bytes(&bytes, b"\x1b[?1u");
     }
 
     #[test]

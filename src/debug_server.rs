@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
@@ -9,7 +9,7 @@ use serde::Serialize;
 use tiny_http::{Header, Response, Server, StatusCode};
 
 use crate::GridSize;
-use crate::pty::write_to_pty;
+use crate::pty::PtyWriteHandle;
 
 const DEBUG_HTTP_DEFAULT_HOST: &str = "127.0.0.1";
 const DEBUG_HTTP_DEFAULT_PORT_START: u16 = 37878;
@@ -291,7 +291,7 @@ impl SharedDebugState {
 
 pub(crate) fn start_debug_http_server(
     debug: SharedDebugState,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    writer: Option<PtyWriteHandle>,
     config: DebugHttpConfig,
 ) {
     if let Some(addr) = std::env::var("AGENT_TUI_DEBUG_ADDR")
@@ -343,7 +343,7 @@ fn addr_is_loopback(addr: &str) -> bool {
 
 fn start_debug_http_server_on_default_port_range(
     debug: SharedDebugState,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    writer: Option<PtyWriteHandle>,
     config: DebugHttpConfig,
 ) {
     let _ = thread::Builder::new()
@@ -395,7 +395,7 @@ fn next_default_debug_http_addr() -> String {
 
 pub(crate) fn start_debug_http_server_at_addr(
     debug: SharedDebugState,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    writer: Option<PtyWriteHandle>,
     addr: String,
     config: DebugHttpConfig,
 ) {
@@ -417,7 +417,7 @@ pub(crate) fn start_debug_http_server_at_addr(
 fn serve_debug_http(
     server: Server,
     debug: SharedDebugState,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    writer: Option<PtyWriteHandle>,
     addr: String,
     config: DebugHttpConfig,
 ) {
@@ -506,7 +506,7 @@ pub(crate) fn handle_debug_request(
     method: &str,
     path: &str,
     debug: &SharedDebugState,
-    writer: Option<&Arc<Mutex<Box<dyn Write + Send>>>>,
+    writer: Option<&PtyWriteHandle>,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     match (method, path) {
         ("GET", "/debug") => text_response(
@@ -553,15 +553,12 @@ pub(crate) fn handle_debug_request(
                 return text_response(400, "text/plain; charset=utf-8", "input body is empty\n");
             }
 
-            match write_to_pty(writer, &body) {
-                Ok(()) => {
-                    debug.record_bytes_to_pty(body.len(), true);
-                    text_response(200, "text/plain; charset=utf-8", "input injected\n")
-                }
-                Err(err) => {
-                    debug.set_error(format!("debug input write failed: {err:#}"));
-                    text_response(500, "text/plain; charset=utf-8", "failed to write to pty\n")
-                }
+            if writer.write(&body) {
+                debug.record_bytes_to_pty(body.len(), true);
+                text_response(200, "text/plain; charset=utf-8", "input injected\n")
+            } else {
+                debug.set_error("debug input write failed: pty writer queue rejected the bytes");
+                text_response(500, "text/plain; charset=utf-8", "failed to write to pty\n")
             }
         }
         ("POST", "/debug/replace-line") => {
@@ -583,15 +580,14 @@ pub(crate) fn handle_debug_request(
             payload.push(0x15);
             payload.extend_from_slice(&body);
 
-            match write_to_pty(writer, &payload) {
-                Ok(()) => {
-                    debug.record_bytes_to_pty(payload.len(), true);
-                    text_response(200, "text/plain; charset=utf-8", "input line replaced\n")
-                }
-                Err(err) => {
-                    debug.set_error(format!("debug replace-line write failed: {err:#}"));
-                    text_response(500, "text/plain; charset=utf-8", "failed to write to pty\n")
-                }
+            if writer.write(&payload) {
+                debug.record_bytes_to_pty(payload.len(), true);
+                text_response(200, "text/plain; charset=utf-8", "input line replaced\n")
+            } else {
+                debug.set_error(
+                    "debug replace-line write failed: pty writer queue rejected the bytes",
+                );
+                text_response(500, "text/plain; charset=utf-8", "failed to write to pty\n")
             }
         }
         _ => text_response(404, "text/plain; charset=utf-8", "not found\n"),
@@ -613,6 +609,7 @@ fn text_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
     use std::time::Duration;
@@ -692,10 +689,7 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 401"), "response: {response}");
 
-        assert!(
-            sink.lock().is_empty(),
-            "unauthenticated request must not reach the PTY"
-        );
+        assert_nothing_written(&sink, "unauthenticated request must not reach the PTY");
     }
 
     #[test]
@@ -707,7 +701,7 @@ mod tests {
             post_request(&addr, "/debug/input", Some("wrong-token"), "echo pwned\n"),
         );
         assert!(response.starts_with("HTTP/1.1 401"), "response: {response}");
-        assert!(sink.lock().is_empty(), "wrong token must not reach the PTY");
+        assert_nothing_written(&sink, "wrong token must not reach the PTY");
     }
 
     /// 读端点同样要认证：/debug/state 会带回整屏文本。
@@ -768,7 +762,7 @@ mod tests {
             ),
         );
         assert!(response.starts_with("HTTP/1.1 413"), "response: {response}");
-        assert!(sink.lock().is_empty());
+        assert_nothing_written(&sink, "oversized body must not reach the PTY");
     }
 
     #[test]
@@ -833,7 +827,12 @@ mod tests {
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(BufferWriter { sink: sink.clone() })));
 
-        start_debug_http_server_at_addr(debug, Some(writer), addr.clone(), test_config());
+        start_debug_http_server_at_addr(
+            debug,
+            Some(PtyWriteHandle::spawn(writer)),
+            addr.clone(),
+            test_config(),
+        );
         wait_for_server(&addr);
         (addr, sink)
     }
@@ -857,6 +856,13 @@ mod tests {
             body.len(),
             body
         )
+    }
+
+    /// 反向断言：写入是投递到专职线程的异步操作（见 ROB-2），立刻检查空 sink 会
+    /// **假通过**——被拒的请求和"还没写完"的请求看起来一样。所以先给足时间窗口。
+    fn assert_nothing_written(sink: &Arc<Mutex<Vec<u8>>>, message: &str) {
+        thread::sleep(Duration::from_millis(100));
+        assert!(sink.lock().is_empty(), "{message}");
     }
 
     fn wait_for_sink(sink: &Arc<Mutex<Vec<u8>>>, expected: &[u8]) {

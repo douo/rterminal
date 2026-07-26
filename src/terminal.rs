@@ -39,6 +39,7 @@ use crate::grid_cells::{
 };
 use crate::input::{ExternalFileDragState, FocusActivationMouseGuard};
 use crate::input_log::InputLogger;
+use crate::input_mirror::InputLineMirror;
 use crate::keyboard::encode_keystroke;
 use crate::pty::{PtySession, PtyWriteHandle};
 use crate::render::{
@@ -198,6 +199,198 @@ pub(crate) struct EnterLatencyProbe {
     pub(crate) first_pty_at: Option<Instant>,
 }
 
+/// 光标滑动动画的全部状态（ARCH-3）。
+///
+/// 字段私有：动画目标只能经 [`Self::update_target`] 推进，别处不得直改
+/// 中间量——那正是这组字段平铺在 `AgentTerminal` 顶层时发生过的事。
+pub(crate) struct CursorSlide {
+    enabled: bool,
+    initialized: bool,
+    visual_row: usize,
+    anim_from_col: f32,
+    anim_to_col: f32,
+    anim_started_at: Option<Instant>,
+}
+
+impl CursorSlide {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            initialized: false,
+            visual_row: 0,
+            anim_from_col: 0.0,
+            anim_to_col: 0.0,
+            anim_started_at: None,
+        }
+    }
+
+    /// 当前应绘制的 (row, col, 是否在动画中)；未初始化或未启用时用真实光标位置。
+    pub(crate) fn visual_state(
+        &self,
+        fallback_row: usize,
+        fallback_col: usize,
+    ) -> (usize, f32, bool) {
+        if !self.enabled || !self.initialized {
+            return (fallback_row, fallback_col as f32, false);
+        }
+
+        let now = Instant::now();
+        (
+            self.visual_row,
+            self.visual_col_at(now),
+            self.animation_active_at(now),
+        )
+    }
+
+    /// 渲染拖尾需要知道动画起点列。
+    pub(crate) fn anim_from_col(&self) -> f32 {
+        self.anim_from_col
+    }
+
+    fn snap_to(&mut self, row: usize, col: f32) {
+        self.initialized = true;
+        self.visual_row = row;
+        self.anim_from_col = col;
+        self.anim_to_col = col;
+        self.anim_started_at = None;
+    }
+
+    fn update_target(&mut self, row: usize, col: usize) {
+        let target_col = col as f32;
+        let now = Instant::now();
+
+        if !self.enabled || !self.initialized {
+            self.snap_to(row, target_col);
+            return;
+        }
+
+        let current_col = self.visual_col_at(now);
+        let row_changed = self.visual_row != row;
+        let large_delta = (target_col - current_col).abs() > CURSOR_SLIDE_MAX_COL_DELTA;
+        if row_changed || large_delta {
+            self.snap_to(row, target_col);
+            return;
+        }
+
+        if (target_col - self.anim_to_col).abs() < f32::EPSILON {
+            if !self.animation_active_at(now) {
+                self.anim_from_col = target_col;
+                self.anim_to_col = target_col;
+                self.anim_started_at = None;
+            }
+            self.visual_row = row;
+            return;
+        }
+
+        self.visual_row = row;
+        self.anim_from_col = current_col;
+        self.anim_to_col = target_col;
+        self.anim_started_at = Some(now);
+    }
+
+    fn visual_col_at(&self, now: Instant) -> f32 {
+        let Some(started_at) = self.anim_started_at else {
+            return self.anim_to_col;
+        };
+
+        let elapsed = now.saturating_duration_since(started_at);
+        let duration_ms = CURSOR_SLIDE_DURATION.as_millis().max(1) as f32;
+        let progress = (elapsed.as_millis() as f32 / duration_ms).clamp(0.0, 1.0);
+        let eased = progress * (2.0 - progress); // ease-out quad
+        self.anim_from_col + (self.anim_to_col - self.anim_from_col) * eased
+    }
+
+    fn animation_active_at(&self, now: Instant) -> bool {
+        let Some(started_at) = self.anim_started_at else {
+            return false;
+        };
+        now.saturating_duration_since(started_at) < CURSOR_SLIDE_DURATION
+            && (self.anim_to_col - self.anim_from_col).abs() >= f32::EPSILON
+    }
+}
+
+/// 键入 → 回显的延迟探针与 PTY 摄取采样（ARCH-3 分组，纯诊断数据）。
+#[derive(Debug)]
+pub(crate) struct LatencyDiagnostics {
+    pty_sample_started_at: Instant,
+    pty_sample_bytes: usize,
+    pty_sample_chunks: usize,
+    last_pty_chunk_at: Option<Instant>,
+    enter_latency_seq: u64,
+    enter_latency_probe: Option<EnterLatencyProbe>,
+}
+
+impl LatencyDiagnostics {
+    fn new() -> Self {
+        Self {
+            pty_sample_started_at: Instant::now(),
+            pty_sample_bytes: 0,
+            pty_sample_chunks: 0,
+            last_pty_chunk_at: None,
+            enter_latency_seq: 0,
+            enter_latency_probe: None,
+        }
+    }
+}
+
+/// 鼠标选区状态机（ARCH-3）。字段私有：选区只能整体开始 / 推进 / 清空，
+/// 不允许别处单改某一半端点把状态机改出中间态。
+pub(crate) struct SelectionState {
+    mode_active: bool,
+    button: Option<gpui::MouseButton>,
+    anchor: Option<SelectionPoint>,
+    focus: Option<SelectionPoint>,
+}
+
+impl SelectionState {
+    fn new() -> Self {
+        Self {
+            mode_active: false,
+            button: None,
+            anchor: None,
+            focus: None,
+        }
+    }
+
+    /// 是否处于拖拽选择中（按下未松开）。
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.mode_active
+    }
+
+    pub(crate) fn drag_button(&self) -> Option<gpui::MouseButton> {
+        self.button
+    }
+
+    pub(crate) fn start(&mut self, point: SelectionPoint, button: gpui::MouseButton) {
+        self.mode_active = true;
+        self.button = Some(button);
+        self.anchor = Some(point);
+        self.focus = Some(point);
+    }
+
+    /// 推进焦点端；返回是否真的移动了（用于决定要不要重绘）。
+    pub(crate) fn update_focus(&mut self, point: SelectionPoint) -> bool {
+        if self.focus == Some(point) {
+            return false;
+        }
+        self.focus = Some(point);
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.mode_active = false;
+        self.button = None;
+        self.anchor = None;
+        self.focus = None;
+    }
+
+    pub(crate) fn bounds(&self) -> Option<(SelectionPoint, SelectionPoint)> {
+        let anchor = self.anchor?;
+        let focus = self.focus?;
+        Some(crate::grid_cells::normalize_selection_bounds(anchor, focus))
+    }
+}
+
 pub(crate) struct AgentTerminal {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) term: Term<TitleTrackingListener>,
@@ -210,15 +403,10 @@ pub(crate) struct AgentTerminal {
     pub(crate) images: TerminalImages,
     pub(crate) cursor_shape: CursorShape,
     pub(crate) force_vertical_cursor: bool,
-    pub(crate) cursor_slide_enabled: bool,
     pub(crate) cursor_trail_enabled: bool,
     pub(crate) convenience_state: ConvenienceState,
     pub(crate) option_as_meta: bool,
-    pub(crate) cursor_visual_initialized: bool,
-    pub(crate) cursor_visual_row: usize,
-    pub(crate) cursor_anim_from_col: f32,
-    pub(crate) cursor_anim_to_col: f32,
-    pub(crate) cursor_anim_started_at: Option<Instant>,
+    pub(crate) cursor_slide: CursorSlide,
     pub(crate) shell: String,
     pub(crate) terminal_title: Arc<Mutex<Option<String>>>,
     pub(crate) show_title_bar: bool,
@@ -237,30 +425,19 @@ pub(crate) struct AgentTerminal {
     pub(crate) master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
     pub(crate) writer: Option<PtyWriteHandle>,
     pub(crate) child: Option<Arc<Mutex<Box<dyn Child + Send>>>>,
-    pub(crate) input_line: String,
-    pub(crate) input_cursor_utf16: usize,
+    pub(crate) input_mirror: InputLineMirror,
     pub(crate) ime_marked_text: Option<String>,
-    pub(crate) last_ax_published_line: String,
-    pub(crate) last_ax_published_cursor_utf16: usize,
     pub(crate) input_trace: bool,
     pub(crate) input_logger: Option<InputLogger>,
     pub(crate) last_local_key_event_at: Option<Instant>,
     pub(crate) last_focus_in_at: Option<Instant>,
-    pub(crate) pty_sample_started_at: Instant,
-    pub(crate) pty_sample_bytes: usize,
-    pub(crate) pty_sample_chunks: usize,
-    pub(crate) last_pty_chunk_at: Option<Instant>,
-    pub(crate) enter_latency_seq: u64,
-    pub(crate) enter_latency_probe: Option<EnterLatencyProbe>,
+    latency: LatencyDiagnostics,
     pub(crate) mouse_scroll_accum_x: f32,
     pub(crate) mouse_scroll_accum_y: f32,
     pub(crate) last_mouse_report: Option<(usize, usize, u8)>,
     pub(crate) focus_activation_mouse: FocusActivationMouseGuard,
     pub(crate) external_file_drag: ExternalFileDragState,
-    pub(crate) selection_mode_active: bool,
-    pub(crate) selection_button: Option<gpui::MouseButton>,
-    pub(crate) selection_anchor: Option<SelectionPoint>,
-    pub(crate) selection_focus: Option<SelectionPoint>,
+    pub(crate) selection: SelectionState,
     pub(crate) canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     pub(crate) paste_guard_prompt_open: bool,
     pub(crate) shell_exited: bool,
@@ -429,15 +606,10 @@ impl AgentTerminal {
             images: TerminalImages::new(),
             cursor_shape: CursorShape::Block,
             force_vertical_cursor: cli.force_vertical_cursor,
-            cursor_slide_enabled: !cli.no_cursor_slide,
+            cursor_slide: CursorSlide::new(!cli.no_cursor_slide),
             cursor_trail_enabled: cli.cursor_trail,
             convenience_state: ConvenienceState::new(),
             option_as_meta: !cli.no_option_as_meta,
-            cursor_visual_initialized: false,
-            cursor_visual_row: 0,
-            cursor_anim_from_col: 0.0,
-            cursor_anim_to_col: 0.0,
-            cursor_anim_started_at: None,
             shell,
             terminal_title: terminal_title.clone(),
             show_title_bar: options.show_title_bar,
@@ -454,30 +626,19 @@ impl AgentTerminal {
             master,
             writer,
             child,
-            input_line: String::new(),
-            input_cursor_utf16: 0,
+            input_mirror: InputLineMirror::new(),
             ime_marked_text: None,
-            last_ax_published_line: String::new(),
-            last_ax_published_cursor_utf16: 0,
             input_trace: is_input_trace_enabled(),
             input_logger,
             last_local_key_event_at: None,
             last_focus_in_at: None,
-            pty_sample_started_at: Instant::now(),
-            pty_sample_bytes: 0,
-            pty_sample_chunks: 0,
-            last_pty_chunk_at: None,
-            enter_latency_seq: 0,
-            enter_latency_probe: None,
+            latency: LatencyDiagnostics::new(),
             mouse_scroll_accum_x: 0.0,
             mouse_scroll_accum_y: 0.0,
             last_mouse_report: None,
             focus_activation_mouse: FocusActivationMouseGuard::default(),
             external_file_drag: ExternalFileDragState::default(),
-            selection_mode_active: false,
-            selection_button: None,
-            selection_anchor: None,
-            selection_focus: None,
+            selection: SelectionState::new(),
             canvas_bounds: Arc::new(Mutex::new(None)),
             paste_guard_prompt_open: false,
             shell_exited: false,
@@ -833,7 +994,8 @@ impl AgentTerminal {
                 cursor.shape
             };
         self.cursor_shape = effective_cursor_shape;
-        self.update_cursor_visual_target(cursor_row.min(rows.saturating_sub(1)), cursor_col);
+        self.cursor_slide
+            .update_target(cursor_row.min(rows.saturating_sub(1)), cursor_col);
 
         self.snapshot = Arc::new(ScreenSnapshot {
             cells,
@@ -892,15 +1054,19 @@ impl AgentTerminal {
     /// 读方向：发现外部工具经 AX 改写的输入行并回写模型；写方向：把影子输入行
     /// 发布给 AX。二者都可能改 `self`，所以它们必须待在 update 路径而不是 render 里。
     fn sync_ax_and_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let model_line = self.input_line.clone();
-        let model_cursor_utf16 = self.input_cursor_utf16;
+        let model_line = self.input_mirror.line().to_string();
+        let model_cursor_utf16 = self.input_mirror.cursor_utf16();
         let allow_ax_override = self.allow_ax_override();
+        let (last_published_line, last_published_cursor) = {
+            let (line, cursor) = self.input_mirror.last_published();
+            (line.to_string(), cursor)
+        };
         let sync_result = crate::macos_ax::sync_native_ax_input_view(
             window,
             &model_line,
             model_cursor_utf16,
-            &self.last_ax_published_line,
-            self.last_ax_published_cursor_utf16,
+            &last_published_line,
+            last_published_cursor,
             allow_ax_override,
         );
         if let Some(state) = sync_result.override_from_ax
@@ -909,8 +1075,8 @@ impl AgentTerminal {
             cx.notify();
         }
         if sync_result.published_model {
-            self.last_ax_published_line = model_line;
-            self.last_ax_published_cursor_utf16 = model_cursor_utf16;
+            self.input_mirror
+                .mark_published(model_line, model_cursor_utf16);
         }
         if self.convenience_state.refresh_input_mode_if_due() {
             cx.notify();
@@ -1103,101 +1269,12 @@ impl AgentTerminal {
     }
 
     pub(crate) fn cursor_visual_state(&self) -> (usize, f32, bool) {
-        if !self.cursor_slide_enabled {
-            return (
-                self.snapshot.cursor_row,
-                self.snapshot.cursor_col as f32,
-                false,
-            );
-        }
-
-        if !self.cursor_visual_initialized {
-            return (
-                self.snapshot.cursor_row,
-                self.snapshot.cursor_col as f32,
-                false,
-            );
-        }
-
-        let now = Instant::now();
-        (
-            self.cursor_visual_row,
-            self.cursor_visual_col_at(now),
-            self.cursor_animation_active_at(now),
-        )
-    }
-
-    fn update_cursor_visual_target(&mut self, row: usize, col: usize) {
-        let target_col = col as f32;
-        let now = Instant::now();
-
-        if !self.cursor_slide_enabled {
-            self.cursor_visual_initialized = true;
-            self.cursor_visual_row = row;
-            self.cursor_anim_from_col = target_col;
-            self.cursor_anim_to_col = target_col;
-            self.cursor_anim_started_at = None;
-            return;
-        }
-
-        if !self.cursor_visual_initialized {
-            self.cursor_visual_initialized = true;
-            self.cursor_visual_row = row;
-            self.cursor_anim_from_col = target_col;
-            self.cursor_anim_to_col = target_col;
-            self.cursor_anim_started_at = None;
-            return;
-        }
-
-        let current_col = self.cursor_visual_col_at(now);
-        let row_changed = self.cursor_visual_row != row;
-        let large_delta = (target_col - current_col).abs() > CURSOR_SLIDE_MAX_COL_DELTA;
-        if row_changed || large_delta {
-            self.cursor_visual_row = row;
-            self.cursor_anim_from_col = target_col;
-            self.cursor_anim_to_col = target_col;
-            self.cursor_anim_started_at = None;
-            return;
-        }
-
-        if (target_col - self.cursor_anim_to_col).abs() < f32::EPSILON {
-            if !self.cursor_animation_active_at(now) {
-                self.cursor_anim_from_col = target_col;
-                self.cursor_anim_to_col = target_col;
-                self.cursor_anim_started_at = None;
-            }
-            self.cursor_visual_row = row;
-            return;
-        }
-
-        self.cursor_visual_row = row;
-        self.cursor_anim_from_col = current_col;
-        self.cursor_anim_to_col = target_col;
-        self.cursor_anim_started_at = Some(now);
-    }
-
-    fn cursor_visual_col_at(&self, now: Instant) -> f32 {
-        let Some(started_at) = self.cursor_anim_started_at else {
-            return self.cursor_anim_to_col;
-        };
-
-        let elapsed = now.saturating_duration_since(started_at);
-        let duration_ms = CURSOR_SLIDE_DURATION.as_millis().max(1) as f32;
-        let progress = (elapsed.as_millis() as f32 / duration_ms).clamp(0.0, 1.0);
-        let eased = progress * (2.0 - progress); // ease-out quad
-        self.cursor_anim_from_col + (self.cursor_anim_to_col - self.cursor_anim_from_col) * eased
-    }
-
-    fn cursor_animation_active_at(&self, now: Instant) -> bool {
-        let Some(started_at) = self.cursor_anim_started_at else {
-            return false;
-        };
-        now.saturating_duration_since(started_at) < CURSOR_SLIDE_DURATION
-            && (self.cursor_anim_to_col - self.cursor_anim_from_col).abs() >= f32::EPSILON
+        self.cursor_slide
+            .visual_state(self.snapshot.cursor_row, self.snapshot.cursor_col)
     }
 
     pub(crate) fn start_enter_latency_probe(&mut self, input_line: &str) -> u64 {
-        if let Some(previous) = self.enter_latency_probe.take() {
+        if let Some(previous) = self.latency.enter_latency_probe.take() {
             self.log_enter_latency_event(
                 "enter_latency_abandoned",
                 previous.id,
@@ -1207,9 +1284,9 @@ impl AgentTerminal {
             );
         }
 
-        self.enter_latency_seq = self.enter_latency_seq.saturating_add(1);
+        self.latency.enter_latency_seq = self.latency.enter_latency_seq.saturating_add(1);
         let probe = EnterLatencyProbe {
-            id: self.enter_latency_seq,
+            id: self.latency.enter_latency_seq,
             keydown_at: Instant::now(),
             write_done_at: None,
             first_pty_at: None,
@@ -1224,13 +1301,13 @@ impl AgentTerminal {
                 "input_line": summarize_text_for_trace(input_line),
             }),
         );
-        self.enter_latency_probe = Some(probe);
-        self.enter_latency_seq
+        self.latency.enter_latency_probe = Some(probe);
+        self.latency.enter_latency_seq
     }
 
     pub(crate) fn mark_enter_latency_write_done(&mut self, probe_id: u64, bytes_len: usize) {
         let now = Instant::now();
-        let Some(probe) = self.enter_latency_probe.as_mut() else {
+        let Some(probe) = self.latency.enter_latency_probe.as_mut() else {
             return;
         };
         if probe.id != probe_id || probe.write_done_at.is_some() {
@@ -1252,7 +1329,7 @@ impl AgentTerminal {
 
     pub(crate) fn mark_enter_latency_first_pty(&mut self) {
         let now = Instant::now();
-        let Some(probe) = self.enter_latency_probe.as_mut() else {
+        let Some(probe) = self.latency.enter_latency_probe.as_mut() else {
             return;
         };
         if probe.write_done_at.is_none() || probe.first_pty_at.is_some() {
@@ -1272,11 +1349,11 @@ impl AgentTerminal {
 
     pub(crate) fn mark_enter_latency_first_paint(&mut self) {
         let now = Instant::now();
-        let Some(probe) = self.enter_latency_probe.take() else {
+        let Some(probe) = self.latency.enter_latency_probe.take() else {
             return;
         };
         if probe.first_pty_at.is_none() {
-            self.enter_latency_probe = Some(probe);
+            self.latency.enter_latency_probe = Some(probe);
             return;
         }
 
@@ -1335,7 +1412,7 @@ impl AgentTerminal {
         };
 
         let now = Instant::now();
-        if let Some(last_chunk_at) = self.last_pty_chunk_at {
+        if let Some(last_chunk_at) = self.latency.last_pty_chunk_at {
             let gap = now.saturating_duration_since(last_chunk_at);
             if gap >= Duration::from_millis(800) {
                 logger.log_event(
@@ -1347,19 +1424,19 @@ impl AgentTerminal {
                 );
             }
         }
-        self.last_pty_chunk_at = Some(now);
+        self.latency.last_pty_chunk_at = Some(now);
 
-        self.pty_sample_bytes += chunk_len;
-        self.pty_sample_chunks += 1;
+        self.latency.pty_sample_bytes += chunk_len;
+        self.latency.pty_sample_chunks += 1;
 
-        let window = now.saturating_duration_since(self.pty_sample_started_at);
+        let window = now.saturating_duration_since(self.latency.pty_sample_started_at);
         if window < Duration::from_millis(500) {
             return;
         }
 
         let window_ms = window.as_millis().max(1);
-        let bytes = self.pty_sample_bytes as u128;
-        let chunks = self.pty_sample_chunks as u128;
+        let bytes = self.latency.pty_sample_bytes as u128;
+        let chunks = self.latency.pty_sample_chunks as u128;
 
         logger.log_event(
             "pty_ingest_sample",
@@ -1372,9 +1449,9 @@ impl AgentTerminal {
             }),
         );
 
-        self.pty_sample_started_at = now;
-        self.pty_sample_bytes = 0;
-        self.pty_sample_chunks = 0;
+        self.latency.pty_sample_started_at = now;
+        self.latency.pty_sample_bytes = 0;
+        self.latency.pty_sample_chunks = 0;
     }
 }
 

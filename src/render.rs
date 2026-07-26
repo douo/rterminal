@@ -256,7 +256,7 @@ impl Render for AgentTerminal {
         let cursor_shape = self.cursor_shape;
         let (cursor_visual_row, cursor_visual_col, cursor_sliding) = self.cursor_visual_state();
         let cursor_trail_enabled = self.cursor_trail_enabled;
-        let cursor_anim_from_col = self.cursor_anim_from_col;
+        let cursor_anim_from_col = self.cursor_slide.anim_from_col();
         if cursor_sliding {
             cx.on_next_frame(window, |_, _, cx| {
                 cx.notify();

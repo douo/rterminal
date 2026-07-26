@@ -12,9 +12,8 @@ use serde_json::json;
 
 use crate::AgentTerminal;
 use crate::grid_cells::{
-    cell_advance_cols, extract_selection_text, logical_col_for_visual_col,
-    normalize_selection_bounds, normalize_selection_col, row_text_without_wide_spacers,
-    visual_extra_cols_before,
+    cell_advance_cols, extract_selection_text, logical_col_for_visual_col, normalize_selection_col,
+    row_text_without_wide_spacers, visual_extra_cols_before,
 };
 use crate::keyboard::{
     KittyKeyEventType, encode_keystroke_with_mode, is_paste_shortcut, is_select_all_shortcut,
@@ -26,10 +25,7 @@ use crate::render::{
     terminal_content_padding_y,
 };
 use crate::terminal::SelectionPoint;
-use crate::text_utils::{
-    delete_next_word_utf16, delete_previous_word_utf16, delete_to_end_utf16,
-    summarize_text_for_trace, utf16_substring, utf16_to_byte_index,
-};
+use crate::text_utils::{summarize_text_for_trace, utf16_substring, utf16_to_byte_index};
 
 const FONT_SIZE_STEP: f32 = 1.0;
 const PASTE_GUARD_MIN_LINES: usize = 4;
@@ -283,8 +279,8 @@ impl AgentTerminal {
             "ime_commit_marked_text",
             json!({
                 "text": self.input_log_text_value(&text),
-                "before_line": self.input_log_text_value(&self.input_line),
-                "before_cursor_utf16": self.input_cursor_utf16,
+                "before_line": self.input_log_text_value(self.input_mirror.line()),
+                "before_cursor_utf16": self.input_mirror.cursor_utf16(),
             }),
         );
 
@@ -370,148 +366,33 @@ impl AgentTerminal {
             json!({
                 "path_count": paths.paths().len(),
                 "text": self.input_log_text_value(&text),
-                "input_line": self.input_log_text_value(&self.input_line),
-                "input_cursor_utf16": self.input_cursor_utf16,
+                "input_line": self.input_log_text_value(self.input_mirror.line()),
+                "input_cursor_utf16": self.input_mirror.cursor_utf16(),
             }),
         );
     }
 
     pub(crate) fn input_line_len_utf16(&self) -> usize {
-        self.input_line.encode_utf16().count()
-    }
-
-    pub(crate) fn clamp_input_cursor(&mut self) {
-        self.input_cursor_utf16 = self.input_cursor_utf16.min(self.input_line_len_utf16());
+        self.input_mirror.len_utf16()
     }
 
     pub(crate) fn insert_input_text_at_cursor(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-
-        self.clamp_input_cursor();
-        let cursor_byte = utf16_to_byte_index(&self.input_line, self.input_cursor_utf16);
-        self.input_line.insert_str(cursor_byte, text);
-        self.input_cursor_utf16 += text.encode_utf16().count();
-    }
-
-    pub(crate) fn backspace_input_char(&mut self) {
-        self.clamp_input_cursor();
-        if self.input_cursor_utf16 == 0 {
-            return;
-        }
-
-        let cursor_byte = utf16_to_byte_index(&self.input_line, self.input_cursor_utf16);
-        let Some((start_byte, removed)) = self.input_line[..cursor_byte].char_indices().last()
-        else {
-            return;
-        };
-        self.input_line.replace_range(start_byte..cursor_byte, "");
-        self.input_cursor_utf16 = self.input_cursor_utf16.saturating_sub(removed.len_utf16());
-    }
-
-    pub(crate) fn delete_input_char_at_cursor(&mut self) {
-        self.clamp_input_cursor();
-        let cursor_byte = utf16_to_byte_index(&self.input_line, self.input_cursor_utf16);
-        let Some(ch) = self.input_line[cursor_byte..].chars().next() else {
-            return;
-        };
-        let end_byte = cursor_byte + ch.len_utf8();
-        self.input_line.replace_range(cursor_byte..end_byte, "");
-    }
-
-    pub(crate) fn move_input_cursor_left(&mut self) {
-        self.clamp_input_cursor();
-        if self.input_cursor_utf16 == 0 {
-            return;
-        }
-
-        let cursor_byte = utf16_to_byte_index(&self.input_line, self.input_cursor_utf16);
-        if let Some((_, ch)) = self.input_line[..cursor_byte].char_indices().last() {
-            self.input_cursor_utf16 = self.input_cursor_utf16.saturating_sub(ch.len_utf16());
-        } else {
-            self.input_cursor_utf16 = 0;
-        }
-    }
-
-    pub(crate) fn move_input_cursor_right(&mut self) {
-        self.clamp_input_cursor();
-        let len = self.input_line_len_utf16();
-        if self.input_cursor_utf16 >= len {
-            return;
-        }
-
-        let cursor_byte = utf16_to_byte_index(&self.input_line, self.input_cursor_utf16);
-        if let Some(ch) = self.input_line[cursor_byte..].chars().next() {
-            self.input_cursor_utf16 += ch.len_utf16();
-        } else {
-            self.input_cursor_utf16 = len;
-        }
-    }
-
-    pub(crate) fn clear_input_line(&mut self) {
-        self.input_line.clear();
-        self.input_cursor_utf16 = 0;
-    }
-
-    pub(crate) fn delete_previous_input_word(&mut self) {
-        delete_previous_word_utf16(&mut self.input_line, &mut self.input_cursor_utf16);
-        self.clamp_input_cursor();
-    }
-
-    pub(crate) fn delete_next_input_word(&mut self) {
-        delete_next_word_utf16(&mut self.input_line, &mut self.input_cursor_utf16);
-        self.clamp_input_cursor();
-    }
-
-    pub(crate) fn delete_to_end_of_input_line(&mut self) {
-        delete_to_end_utf16(&mut self.input_line, self.input_cursor_utf16);
-        self.clamp_input_cursor();
+        self.input_mirror.insert_at_cursor(text);
     }
 
     pub(crate) fn apply_terminal_bytes_to_input_line(&mut self, bytes: &[u8]) {
-        match bytes {
-            b"\r" => self.clear_input_line(),
-            [0x7f] => self.backspace_input_char(),
-            [0x08] => self.backspace_input_char(), // Ctrl-H
-            [0x01] => self.input_cursor_utf16 = 0, // Ctrl-A
-            [0x05] => self.input_cursor_utf16 = self.input_line_len_utf16(), // Ctrl-E
-            [0x02] => self.move_input_cursor_left(), // Ctrl-B
-            [0x06] => self.move_input_cursor_right(), // Ctrl-F
-            [0x03] => self.clear_input_line(),     // Ctrl-C
-            [0x04] => self.delete_input_char_at_cursor(), // Ctrl-D
-            [0x0b] => self.delete_to_end_of_input_line(), // Ctrl-K
-            [0x17] => self.delete_previous_input_word(), // Ctrl-W
-            [0x15] => self.clear_input_line(),     // Ctrl-U clears current line in common shells.
-            b"\x1b[D" => self.move_input_cursor_left(),
-            b"\x1b[C" => self.move_input_cursor_right(),
-            b"\x1b[H" => self.input_cursor_utf16 = 0,
-            b"\x1b[F" => self.input_cursor_utf16 = self.input_line_len_utf16(),
-            b"\x1b[3~" => self.delete_input_char_at_cursor(),
-            b"\x1b\x7f" => self.delete_previous_input_word(), // Alt-Backspace
-            b"\x1bd" => self.delete_next_input_word(),        // Alt-D
-            _ => {
-                if bytes.first() == Some(&0x1b) {
-                    return;
-                }
-
-                if let Ok(text) = std::str::from_utf8(bytes)
-                    && !text.chars().any(char::is_control)
-                {
-                    self.insert_input_text_at_cursor(text);
-                }
-            }
-        }
+        self.input_mirror.apply_terminal_bytes(bytes);
     }
 
     pub(crate) fn rewrite_terminal_input_line(&mut self) {
         self.write_bytes(&[0x15]); // Ctrl-U clears shell input line.
-        if !self.input_line.is_empty() {
-            let line = self.input_line.clone();
+        if !self.input_mirror.line().is_empty() {
+            let line = self.input_mirror.line().to_string();
             self.write_bytes(line.as_bytes());
         }
 
-        let tail = tail_chars_after_cursor(&self.input_line, self.input_cursor_utf16);
+        let tail =
+            tail_chars_after_cursor(self.input_mirror.line(), self.input_mirror.cursor_utf16());
         for _ in 0..tail {
             self.write_bytes(b"\x1b[D");
         }
@@ -579,8 +460,8 @@ impl AgentTerminal {
             return;
         }
 
-        if self.selection_mode_active {
-            if event.pressed_button != self.selection_button {
+        if self.selection.is_dragging() {
+            if event.pressed_button != self.selection.drag_button() {
                 return;
             }
 
@@ -794,7 +675,7 @@ impl AgentTerminal {
             return;
         }
 
-        if self.selection_mode_active && self.selection_button == Some(event.button) {
+        if self.selection.is_dragging() && self.selection.drag_button() == Some(event.button) {
             let (row, col) = self.mouse_grid_point(event.position, window);
             self.update_selection_focus(row, col);
             let copied = self.copy_current_selection_to_clipboard(cx);
@@ -978,8 +859,8 @@ impl AgentTerminal {
                 "key": event.keystroke.key.clone(),
                 "key_char": event.keystroke.key_char.clone(),
                 "modifiers": format!("{:?}", event.keystroke.modifiers),
-                "input_line": self.input_log_text_value(&self.input_line),
-                "input_cursor_utf16": self.input_cursor_utf16,
+                "input_line": self.input_log_text_value(self.input_mirror.line()),
+                "input_cursor_utf16": self.input_mirror.cursor_utf16(),
             }),
         );
 
@@ -1011,7 +892,7 @@ impl AgentTerminal {
                 cx.notify();
                 return;
             }
-            self.clear_input_line();
+            self.input_mirror.clear();
             self.write_bytes(&[0x15]); // Ctrl-U clears shell input line.
             self.trace_input("keydown cmd-a clear current input line");
             cx.stop_propagation();
@@ -1116,8 +997,8 @@ impl AgentTerminal {
         {
             self.mark_local_key_activity();
             self.debug.record_key_event();
-            let before_line = self.input_line.clone();
-            let before_cursor = self.input_cursor_utf16;
+            let before_line = self.input_mirror.line().to_string();
+            let before_cursor = self.input_mirror.cursor_utf16();
             let enter_probe_id = if event.keystroke.key.eq_ignore_ascii_case("enter") {
                 Some(self.start_enter_latency_probe(&before_line))
             } else {
@@ -1140,8 +1021,8 @@ impl AgentTerminal {
                     "high_priority_control": high_priority_control,
                     "before_line": self.input_log_text_value(&before_line),
                     "before_cursor_utf16": before_cursor,
-                    "after_line": self.input_log_text_value(&self.input_line),
-                    "after_cursor_utf16": self.input_cursor_utf16,
+                    "after_line": self.input_log_text_value(self.input_mirror.line()),
+                    "after_cursor_utf16": self.input_mirror.cursor_utf16(),
                 }),
             );
             if !high_priority_control {
@@ -1230,7 +1111,9 @@ impl AgentTerminal {
         }
 
         let cursor_utf16 = state.cursor_utf16.min(state.text.encode_utf16().count());
-        if self.input_line == state.text && self.input_cursor_utf16 == cursor_utf16 {
+        if self.input_mirror.line() == state.text
+            && self.input_mirror.cursor_utf16() == cursor_utf16
+        {
             return false;
         }
         let screen_match = self.ax_text_matches_screen_context(&state.text);
@@ -1243,14 +1126,14 @@ impl AgentTerminal {
             self.trace_input(format!(
                 "ax override rejected ({}) model={} ax={}",
                 reason,
-                summarize_text_for_trace(&self.input_line),
+                summarize_text_for_trace(self.input_mirror.line()),
                 summarize_text_for_trace(&state.text)
             ));
             self.log_input_event(
                 "ax_override_rejected",
                 json!({
                     "reason": reason,
-                    "model_line": self.input_log_text_value(&self.input_line),
+                    "model_line": self.input_log_text_value(self.input_mirror.line()),
                     "ax_line": self.input_log_text_value(&state.text),
                     "ax_cursor_utf16": cursor_utf16,
                 }),
@@ -1264,8 +1147,7 @@ impl AgentTerminal {
             cursor_utf16
         ));
 
-        self.input_line = state.text;
-        self.input_cursor_utf16 = cursor_utf16;
+        self.input_mirror.set_state(state.text, cursor_utf16);
         // 这里**必须**丢弃而不是提交：外部工具是整行替换，提交会先往 PTY 写一段
         // 随后又被上面这行覆盖掉的文本，让 PTY 与模型直接分叉。
         self.ime_marked_text = None;
@@ -1273,41 +1155,29 @@ impl AgentTerminal {
         self.log_input_event(
             "ax_override_applied",
             json!({
-                "input_line": self.input_log_text_value(&self.input_line),
-                "input_cursor_utf16": self.input_cursor_utf16,
+                "input_line": self.input_log_text_value(self.input_mirror.line()),
+                "input_cursor_utf16": self.input_mirror.cursor_utf16(),
             }),
         );
         true
     }
 
     pub(crate) fn selection_bounds(&self) -> Option<(SelectionPoint, SelectionPoint)> {
-        let anchor = self.selection_anchor?;
-        let focus = self.selection_focus?;
-        Some(normalize_selection_bounds(anchor, focus))
+        self.selection.bounds()
     }
 
     fn start_selection(&mut self, row: usize, col: usize, button: MouseButton) {
         let point = self.normalize_selection_point(row, col);
-        self.selection_mode_active = true;
-        self.selection_button = Some(button);
-        self.selection_anchor = Some(point);
-        self.selection_focus = Some(point);
+        self.selection.start(point, button);
     }
 
     fn update_selection_focus(&mut self, row: usize, col: usize) -> bool {
         let point = self.normalize_selection_point(row, col);
-        if self.selection_focus == Some(point) {
-            return false;
-        }
-        self.selection_focus = Some(point);
-        true
+        self.selection.update_focus(point)
     }
 
     fn clear_selection(&mut self) {
-        self.selection_mode_active = false;
-        self.selection_button = None;
-        self.selection_anchor = None;
-        self.selection_focus = None;
+        self.selection.clear();
     }
 
     fn current_selection_text(&self) -> Option<String> {
@@ -1390,14 +1260,14 @@ impl AgentTerminal {
         let visible_row = visible_row.trim_end();
         ax_text_matches_visible_input_context(
             ax_text,
-            &self.input_line,
+            self.input_mirror.line(),
             visible_row,
             row_before_cursor,
         )
     }
 
     fn ax_text_has_probable_prefix_noise(&self, ax_text: &str) -> bool {
-        probable_ascii_prefix_noise(ax_text, &self.input_line)
+        probable_ascii_prefix_noise(ax_text, self.input_mirror.line())
     }
 }
 
@@ -1766,8 +1636,8 @@ impl EntityInputHandler for AgentTerminal {
             json!({
                 "replacement_range": format!("{:?}", range),
                 "text": self.input_log_text_value(text),
-                "before_line": self.input_log_text_value(&self.input_line),
-                "before_cursor_utf16": self.input_cursor_utf16,
+                "before_line": self.input_log_text_value(self.input_mirror.line()),
+                "before_cursor_utf16": self.input_mirror.cursor_utf16(),
             }),
         );
 
@@ -1782,10 +1652,8 @@ impl EntityInputHandler for AgentTerminal {
             && range.start < range.end
             && range.end <= self.input_line_len_utf16()
         {
-            let start_byte = utf16_to_byte_index(&self.input_line, range.start);
-            let end_byte = utf16_to_byte_index(&self.input_line, range.end);
-            self.input_line.replace_range(start_byte..end_byte, text);
-            self.input_cursor_utf16 = range.start + text.encode_utf16().count();
+            self.input_mirror
+                .replace_range_utf16(range.start, range.end, text);
             self.rewrite_terminal_input_line();
         } else {
             self.insert_input_text_at_cursor(text);
@@ -1794,8 +1662,8 @@ impl EntityInputHandler for AgentTerminal {
         self.log_input_event(
             "ime_replace_text_in_range_applied",
             json!({
-                "after_line": self.input_log_text_value(&self.input_line),
-                "after_cursor_utf16": self.input_cursor_utf16,
+                "after_line": self.input_log_text_value(self.input_mirror.line()),
+                "after_cursor_utf16": self.input_mirror.cursor_utf16(),
             }),
         );
         window.invalidate_character_coordinates();

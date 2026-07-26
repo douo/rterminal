@@ -1687,8 +1687,10 @@ impl EntityInputHandler for AgentTerminal {
             let start = range.start.min(len);
             let end = range.end.min(len);
             if start >= end {
-                *adjusted_range = Some(0..len);
-                return Some(marked_text.clone());
+                // 空 range 查询返回空串（COR-15）：此前返回整个 marked text 并把
+                // range 改写成 0..len，IME 拿到与询问语义不符的答案。
+                *adjusted_range = Some(start..start);
+                return Some(String::new());
             }
 
             *adjusted_range = Some(start..end);
@@ -1708,8 +1710,15 @@ impl EntityInputHandler for AgentTerminal {
         if self.snapshot.alt_screen {
             None
         } else {
+            // 组合期间光标停在 marked text 末尾（COR-15）：恒返回 0..0 会让 IME
+            // 在询问选区时得到"光标在组合串开头"的退化答案。
+            let caret = self
+                .ime_marked_text
+                .as_ref()
+                .map(|text| text.encode_utf16().count())
+                .unwrap_or(0);
             Some(UTF16Selection {
-                range: 0..0,
+                range: caret..caret,
                 reversed: false,
             })
         }
@@ -1744,7 +1753,9 @@ impl EntityInputHandler for AgentTerminal {
     ) {
         // 这里**必须**丢弃而不是提交：输入法正在提交最终文本，它就在下面的 `text`
         // 参数里，再提交一次 marked text 会变成双重插入。
-        self.ime_marked_text = None;
+        // 记住"是否存在组合"：组合提交时 AppKit 传来的 replacement_range 指向的是
+        // **marked 区间**（相对组合串），拿它去改已提交的输入行会毁掉行首内容。
+        let had_marked_text = self.ime_marked_text.take().is_some();
         self.trace_input(format!(
             "ime replace_text_in_range len={} text={}",
             text.len(),
@@ -1760,11 +1771,26 @@ impl EntityInputHandler for AgentTerminal {
             }),
         );
 
-        // IME composition always commits at cursor; range-based replacement is not
-        // supported because our input model writes directly to the PTY shell.
-        let _ = range;
-        self.insert_input_text_at_cursor(text);
-        self.write_text_input(text);
+        // 带 range 的替换（听写、自动纠错、日文再变换改**已提交**文本）走影子模型
+        // 重写（COR-13）：改模型里的对应区间，然后整行 Ctrl-U 重写并退回光标。
+        // 此前忽略 range 退化为追加，纠错结果会重复输入。仅在"无组合、主屏、
+        // range 落在行内"时走这条路；组合提交（range 指 marked 区间）与
+        // alt-screen（vim 等没有可信的行模型）保持追加行为。
+        if let Some(range) = range
+            && !had_marked_text
+            && !self.snapshot.alt_screen
+            && range.start < range.end
+            && range.end <= self.input_line_len_utf16()
+        {
+            let start_byte = utf16_to_byte_index(&self.input_line, range.start);
+            let end_byte = utf16_to_byte_index(&self.input_line, range.end);
+            self.input_line.replace_range(start_byte..end_byte, text);
+            self.input_cursor_utf16 = range.start + text.encode_utf16().count();
+            self.rewrite_terminal_input_line();
+        } else {
+            self.insert_input_text_at_cursor(text);
+            self.write_text_input(text);
+        }
         self.log_input_event(
             "ime_replace_text_in_range_applied",
             json!({

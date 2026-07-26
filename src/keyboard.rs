@@ -160,12 +160,18 @@ fn encode_kitty_keystroke(
         );
     }
 
-    if report_events
-        && event_type != KittyKeyEventType::Press
-        && let Some(bytes) =
+    if report_events && event_type != KittyKeyEventType::Press {
+        if let Some(bytes) =
             encode_kitty_functional_key(key, modifier_code(keystroke), true, event_type)
-    {
-        return Some(bytes);
+        {
+            return Some(bytes);
+        }
+        // REPORT_EVENT_TYPES 要求**所有**键的 release/repeat 都以 CSI-u 上报，
+        // 包括可打印键（COR-12）：此前 'a' 的 release 在仅
+        // DISAMBIGUATE+REPORT_EVENT_TYPES 时被静默丢弃，应用端press/release 无法配对。
+        if let Some(bytes) = encode_kitty_csi_u(keystroke, mode, event_type) {
+            return Some(bytes);
+        }
     }
 
     if disambiguate && should_disambiguate_as_csi_u(keystroke) {
@@ -208,7 +214,7 @@ fn encode_kitty_csi_u(
     let key_code = kitty_key_code(keystroke)?;
     let first_field = kitty_key_code_field(keystroke, key_code, mode);
     let modifier_field = kitty_modifier_field(modifier_code(keystroke), mode, event_type);
-    let text_field = kitty_associated_text_field(keystroke, mode);
+    let text_field = kitty_associated_text_field(keystroke, mode, event_type);
 
     let mut seq = format!("\x1b[{first_field};{modifier_field}");
     if let Some(text_field) = text_field {
@@ -303,10 +309,19 @@ fn kitty_event_type_code(event_type: KittyKeyEventType) -> u8 {
     }
 }
 
-fn kitty_associated_text_field(keystroke: &gpui::Keystroke, mode: TermMode) -> Option<String> {
+fn kitty_associated_text_field(
+    keystroke: &gpui::Keystroke,
+    mode: TermMode,
+    event_type: KittyKeyEventType,
+) -> Option<String> {
     if !mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
         || !mode.contains(TermMode::REPORT_ASSOCIATED_TEXT)
     {
+        return None;
+    }
+
+    // kitty 规范：associated text 不随 release 事件上报（COR-12）。
+    if event_type == KittyKeyEventType::Release {
         return None;
     }
 
@@ -378,7 +393,10 @@ fn encode_modified_special_key(key: &str, modifier_code: u8) -> Option<Vec<u8>> 
         "pagedown" => format!("\x1b[6;{modifier_code}~"),
         "f1" => format!("\x1b[1;{modifier_code}P"),
         "f2" => format!("\x1b[1;{modifier_code}Q"),
-        "f3" => format!("\x1b[1;{modifier_code}R"),
+        // CSI 1;mR 与 DSR 光标位置应答（CSI row;colR）形态冲突，应用端无法区分
+        // "带修饰的 F3" 和 "光标在第 1 行第 m 列"。xterm 因此把带修饰的 F3 挪到
+        // CSI 13;m~，kitty 路径已用该编码，legacy 路径保持一致（COR-12）。
+        "f3" => format!("\x1b[13;{modifier_code}~"),
         "f4" => format!("\x1b[1;{modifier_code}S"),
         "f5" => format!("\x1b[15;{modifier_code}~"),
         "f6" => format!("\x1b[17;{modifier_code}~"),
@@ -838,6 +856,64 @@ mod tests {
                 KittyKeyEventType::Release
             ),
             Some(b"\x1b[120;1:3u".to_vec())
+        );
+    }
+
+    /// 回归（COR-12）：仅 DISAMBIGUATE+REPORT_EVENT_TYPES 时，可打印键的
+    /// release 也要以 CSI-u 上报，否则应用端无法配对 press/release。
+    #[test]
+    fn kitty_reports_printable_release_without_report_all() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "a".to_string(),
+            key_char: Some("a".to_string()),
+        };
+        assert_eq!(
+            encode_keystroke_with_mode(
+                &ks,
+                TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES,
+                KittyKeyEventType::Release
+            ),
+            Some(b"\x1b[97;1:3u".to_vec())
+        );
+    }
+
+    /// 回归（COR-12）：release 事件不携带 associated text（kitty 规范仅 press/repeat 带）。
+    #[test]
+    fn kitty_release_omits_associated_text() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "a".to_string(),
+            key_char: Some("a".to_string()),
+        };
+        let mode = TermMode::REPORT_ALL_KEYS_AS_ESC
+            | TermMode::REPORT_EVENT_TYPES
+            | TermMode::REPORT_ASSOCIATED_TEXT;
+        assert_eq!(
+            encode_keystroke_with_mode(&ks, mode, KittyKeyEventType::Press),
+            Some(b"\x1b[97;1:1;97u".to_vec())
+        );
+        assert_eq!(
+            encode_keystroke_with_mode(&ks, mode, KittyKeyEventType::Release),
+            Some(b"\x1b[97;1:3u".to_vec())
+        );
+    }
+
+    /// 回归（COR-12）：legacy 带修饰 F3 不再编码成 CSI 1;mR——那与 DSR 光标
+    /// 位置应答（CSI row;colR）形态冲突。改用 xterm 的 CSI 13;m~。
+    #[test]
+    fn legacy_modified_f3_avoids_dsr_collision() {
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "f3".to_string(),
+            key_char: None,
+        };
+        assert_eq!(
+            encode_keystroke_with_mode(&ks, TermMode::empty(), KittyKeyEventType::Press),
+            Some(b"\x1b[13;2~".to_vec())
         );
     }
 

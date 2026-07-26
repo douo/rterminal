@@ -118,14 +118,50 @@ This is **not** intended to be a general-purpose terminal replacement. It is an 
 - Option key behavior: Meta/Alt (default) or native macOS character input (`--no-option-as-meta`)
 
 ### Debugging & Observability
-- Local HTTP debug server on `127.0.0.1:37878-37977` (auto-selects the next available port per tab)
-- `GET /debug/state` — JSON snapshot of terminal state, counters, uptime
-- `GET /debug/screen` — plain-text dump of visible terminal content
-- `POST /debug/input` — inject raw bytes into PTY
-- `POST /debug/replace-line` — replace current shell input line
-- `AGENT_TUI_DEBUG_ADDR=127.0.0.1:<port>` — force a specific debug server address
-- Input event tracing: `AGENT_TUI_INPUT_TRACE=1`
-- Structured JSONL input logging: `--input-log-file <path>` (with optional `--input-log-raw`)
+
+**Debug HTTP server — off by default, and for good reason.** `POST /debug/input` writes
+raw bytes to the PTY, so a request containing `\n` runs an arbitrary command in your shell.
+Enable it only when you need it, and only for as long as you need it.
+
+```bash
+cargo run -- --debug-http                        # prints a generated token on stderr
+cargo run -- --debug-http --debug-http-token t   # or supply your own
+```
+
+Every request — reads included — must carry the token in an `X-Debug-Token` header:
+
+```bash
+curl -H "X-Debug-Token: $TOKEN" http://127.0.0.1:37878/debug/state
+```
+
+| Endpoint | Description |
+|---|---|
+| `GET /debug/state` | JSON snapshot of terminal state, counters, uptime |
+| `GET /debug/screen` | Plain-text dump of visible terminal content |
+| `POST /debug/input` | Inject raw bytes into the PTY |
+| `POST /debug/replace-line` | Replace the current shell input line |
+
+Guarantees the server enforces:
+
+- Listens on `127.0.0.1:37878-37977` only (one port per tab).
+- Requires the token on **all** endpoints — the read endpoints return your screen contents,
+  which is as sensitive as write access.
+- Requires a loopback `Host` header, which blocks DNS rebinding.
+- Rejects bodies over 1 MB.
+- `AGENT_TUI_DEBUG_ADDR=127.0.0.1:<port>` forces a specific address, but a non-loopback
+  address is refused unless you also pass `--debug-http-allow-remote`.
+
+The token lives in an `X-Debug-Token` header rather than a query parameter on purpose:
+sending a custom header cross-origin forces a CORS preflight, which fails, so a web page
+cannot reach these endpoints even though it can reach the port.
+
+Other diagnostics:
+
+- Input event tracing: `AGENT_TUI_INPUT_TRACE=1` (writes key/input summaries to stderr)
+- Structured JSONL input logging: `--input-log-file <path>`. ⚠️ Adding `--input-log-raw`
+  records **verbatim** keystrokes, IME commits, and pasted text to that file — including any
+  secrets you type or paste. Even without `--input-log-raw` the log keeps the first 24
+  characters of each value.
 
 ## Usage
 
@@ -169,7 +205,10 @@ between shell-escaped paths.
 | `--no-option-as-meta` | off | Treat Option key as native input instead of Meta/Alt |
 | `--show-status-bar` | off | Show debug status bar at bottom |
 | `--input-log-file <path>` | — | Write structured input events to JSONL file |
-| `--input-log-raw` | off | Include full text values in input log (not truncated) |
+| `--input-log-raw` | off | Include full text values in input log (not truncated) — logs secrets verbatim |
+| `--debug-http` | off | Enable the debug HTTP server (can execute commands in your shell) |
+| `--debug-http-token <token>` | random | Token required by the debug HTTP server |
+| `--debug-http-allow-remote` | off | Permit binding a non-loopback debug address (dangerous) |
 | `--self-check` | — | Run startup self-check and exit |
 
 ### Kitty Keyboard Protocol
@@ -209,20 +248,53 @@ available on the event.
 
 ## Building
 
-Requires Rust 2024 edition (edition = "2024" in Cargo.toml) and macOS (GPUI currently targets macOS).
+Requires macOS (GPUI currently targets macOS). The toolchain is pinned in
+`rust-toolchain.toml`, so `rustup` picks the right version automatically.
 
 ```bash
+cargo fetch                          # required before the patch step below
+scripts/apply-vendor-patches.sh      # see "Required dependency patch"
 cargo build
-cargo test
-cargo run -- --self-check
+scripts/check.sh                     # fmt + clippy + tests + self-check
 ```
+
+### Required dependency patch
+
+`gpui_macos` has a bug where `append_system_fallbacks` builds an iterator chain it never
+consumes, so CoreText's locale-aware cascade list is silently discarded and CJK text falls
+back to whatever user font happens to cover it — typically a handwriting face.
+[Upstream issue](https://github.com/zed-industries/zed/issues/57916).
+
+`patches/gpui_macos-cjk-fallback.patch` fixes it. Because the `gpui` dependency is pinned to
+a git rev, the patch has to be applied inside the cargo checkout, which means
+**`cargo clean -p gpui_macos` or a fresh clone silently reverts it**: the build still
+succeeds, CJK text just renders wrong. `scripts/apply-vendor-patches.sh` is idempotent, and
+`--check` verifies without applying — `scripts/check.sh` and CI both run it, so a missing
+patch fails loudly instead of degrading quietly.
+
+Use `scripts/check.sh` rather than bare `cargo fmt`: the vendored `alacritty_terminal` is a
+workspace member, so an unscoped format run rewrites the whole upstream tree and destroys the
+ability to diff against upstream. See `vendor/alacritty_terminal/VENDOR.md`.
+
+## Security notes
+
+Two features intentionally expose the terminal's contents and input to other local processes.
+Both matter when deciding what to type into this terminal.
+
+- **Accessibility integration** (`macos_ax.rs`) publishes the current input line as an
+  `AXTextField`. This is a core feature — it is what lets voice control and agents read and
+  rewrite your command line — but it also means **any process holding macOS Accessibility
+  permission can read your current command line and substitute text into it**.
+- **Debug HTTP server** is off by default and requires a token; see
+  [Debugging & Observability](#debugging--observability) for the full threat model.
+- **`--input-log-raw`** writes keystrokes and pasted text verbatim to disk.
 
 ## Known Limitations
 
 - **macOS only** — GPUI's platform layer currently targets macOS; Linux/Windows support depends on upstream
-- **Per-cell text shaping** — rendering shapes each character individually rather than batching runs per line; functional but not optimal for performance
+- **Per-cell text shaping** — rendering shapes each character individually rather than batching runs per line; functional but not optimal for performance (see `docs/project-review/` PERF-1)
 - **Input-line model drift** — the shadow `input_line` can desynchronize from the actual shell state in complex scenarios (tmux prefix sequences, shell history navigation, tab completion)
-- **No scrollback UI** — terminal scrollback buffer exists in `alacritty_terminal` but is not yet exposed through scroll interaction
+- **No scrollback UI** — `Cmd+Shift+S` opens a read-only snapshot tab of the current buffer, but the main screen has no scroll-wheel history yet
 - **No search** — no find-in-terminal functionality
 - **No bold/italic font variants** — text style flags are parsed but not rendered with distinct font faces
 - **Kitty keyboard physical-layout detail** — runtime mode negotiation and

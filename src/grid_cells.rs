@@ -201,6 +201,37 @@ pub(crate) fn visual_extra_cols_before(row: &[CellSnapshot], logical_col: usize)
     extra_cols
 }
 
+/// 视觉列 → 逻辑列（[`visual_extra_cols_before`] 的逆映射）。
+///
+/// 渲染把 cell 画在 `col_index + extra_visual_cols` 的视觉位置；鼠标命中必须走
+/// 同一套换算，否则 `--double-width-chars` 下 hover 高亮（走渲染语义，正确）与
+/// 点击命中（此前是纯线性除法）会指向不同的 cell（DSP-4）。
+pub(crate) fn logical_col_for_visual_col(row: &[CellSnapshot], visual_col: f32) -> usize {
+    let visual_col = visual_col.max(0.0);
+    let mut covered_until_col = 0usize;
+    let mut extra_visual_cols = 0f32;
+    let mut last_content_col = 0usize;
+
+    for (col_index, cell) in row.iter().enumerate() {
+        if col_index < covered_until_col {
+            continue;
+        }
+        let x_cols = col_index as f32 + extra_visual_cols;
+        let visual_width = f32::from(cell.width_cols.max(1));
+        if visual_col < x_cols + visual_width {
+            return col_index;
+        }
+
+        last_content_col = col_index;
+        covered_until_col = col_index.saturating_add(cell_advance_cols(cell));
+        if cell.expands_layout && cell.width_cols > 1 {
+            extra_visual_cols += f32::from(cell.width_cols - 1);
+        }
+    }
+
+    last_content_col
+}
+
 pub(crate) fn normalize_selection_bounds(
     start: SelectionPoint,
     end: SelectionPoint,
@@ -397,6 +428,36 @@ mod tests {
         assert_eq!(visual_extra_cols_before(&row, 2), 0.0);
         assert_eq!(visual_extra_cols_before(&row, 3), 1.0);
         assert_eq!(visual_extra_cols_before(&row, 5), 2.0);
+    }
+
+    #[test]
+    fn logical_col_inverts_visual_offsets() {
+        // 布局：中(宽,0-1) spacer …(强制双宽,视觉2-3) a(视觉4) b(视觉5)
+        let row = vec![
+            wide('中'),
+            spacer(),
+            forced_double('…'),
+            narrow('a'),
+            narrow('b'),
+        ];
+        assert_eq!(logical_col_for_visual_col(&row, 0.0), 0);
+        assert_eq!(logical_col_for_visual_col(&row, 1.9), 0);
+        assert_eq!(logical_col_for_visual_col(&row, 2.0), 2);
+        assert_eq!(logical_col_for_visual_col(&row, 3.9), 2);
+        // 强制双宽把后续 cell 视觉右移 1 列：视觉 4 是逻辑 3。
+        assert_eq!(logical_col_for_visual_col(&row, 4.0), 3);
+        assert_eq!(logical_col_for_visual_col(&row, 5.0), 4);
+        // 超出行尾落到最后一个内容列。
+        assert_eq!(logical_col_for_visual_col(&row, 99.0), 4);
+        assert_eq!(logical_col_for_visual_col(&row, -3.0), 0);
+    }
+
+    #[test]
+    fn logical_col_is_linear_without_special_widths() {
+        let row: Vec<CellSnapshot> = "abcdef".chars().map(narrow).collect();
+        for col in 0..6 {
+            assert_eq!(logical_col_for_visual_col(&row, col as f32 + 0.5), col);
+        }
     }
 
     #[test]

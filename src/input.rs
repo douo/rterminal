@@ -12,8 +12,9 @@ use serde_json::json;
 
 use crate::AgentTerminal;
 use crate::grid_cells::{
-    cell_advance_cols, extract_selection_text, normalize_selection_bounds, normalize_selection_col,
-    row_text_without_wide_spacers,
+    cell_advance_cols, extract_selection_text, logical_col_for_visual_col,
+    normalize_selection_bounds, normalize_selection_col, row_text_without_wide_spacers,
+    visual_extra_cols_before,
 };
 use crate::keyboard::{
     KittyKeyEventType, encode_keystroke_with_mode, is_paste_shortcut, is_select_all_shortcut,
@@ -510,9 +511,7 @@ impl AgentTerminal {
             self.write_bytes(line.as_bytes());
         }
 
-        let tail = self
-            .input_line_len_utf16()
-            .saturating_sub(self.input_cursor_utf16);
+        let tail = tail_chars_after_cursor(&self.input_line, self.input_cursor_utf16);
         for _ in 0..tail {
             self.write_bytes(b"\x1b[D");
         }
@@ -535,8 +534,17 @@ impl AgentTerminal {
             line_height,
             self.grid_size.rows as usize,
         );
+        // 与渲染同源的视觉偏移：强制双宽字符会把光标右移若干视觉列。
+        let extra_cols = self
+            .snapshot
+            .cells
+            .get(self.snapshot.cursor_row)
+            .map(|row| visual_extra_cols_before(row, self.snapshot.cursor_col))
+            .unwrap_or(0.0);
         let cursor_origin = point(
-            element_bounds.origin.x + TEXT_PADDING_X + self.snapshot.cursor_col as f32 * cell_width,
+            element_bounds.origin.x
+                + TEXT_PADDING_X
+                + (self.snapshot.cursor_col as f32 + extra_cols) * cell_width,
             element_bounds.origin.y
                 + dynamic_padding_y
                 + self.snapshot.cursor_row as f32 * line_height,
@@ -934,14 +942,22 @@ impl AgentTerminal {
             )
         };
 
-        let raw_col = ((position.x - origin.x) / cell_width).floor() as i32;
+        let raw_visual_col = (position.x - origin.x) / cell_width;
         let raw_row = ((position.y - origin.y) / line_height).floor() as i32;
 
-        let max_col = self.grid_size.cols.saturating_sub(1) as i32;
+        let max_col = self.grid_size.cols.saturating_sub(1) as usize;
         let max_row = self.grid_size.rows.saturating_sub(1) as i32;
 
-        let col = raw_col.clamp(0, max_col) as usize;
         let row = raw_row.clamp(0, max_row) as usize;
+        // 视觉列 → 逻辑列必须与渲染共用同一逆映射（DSP-4）：`--double-width-chars`
+        // 下渲染给强制双宽字符累加了 extra_visual_cols，纯线性除法会让点击命中
+        // 相对 hover 高亮整体右偏。
+        let col = match self.snapshot.cells.get(row) {
+            Some(cells) if !cells.is_empty() => {
+                logical_col_for_visual_col(cells, raw_visual_col.floor()).min(max_col)
+            }
+            _ => (raw_visual_col.floor() as i32).clamp(0, max_col as i32) as usize,
+        };
         (row, col)
     }
 
@@ -1601,6 +1617,17 @@ fn shell_escape_path(path: &Path) -> String {
     escaped
 }
 
+/// 重写输入行后把 shell 光标退回原位要发的左箭头次数，按**字符**计（COR-4）。
+///
+/// zle/readline 的 backward-char 一次跨过一个字符，与 UTF-16 单元数（emoji 为 2）
+/// 和 wcwidth 列宽（CJK 为 2）都无关。此前按 UTF-16 单元发送，光标停在 emoji
+/// 后面时每个多退一格；TODO.md #4 曾提议按列宽发送，那会让 CJK 多退一倍——
+/// 方向也是错的。
+fn tail_chars_after_cursor(line: &str, cursor_utf16: usize) -> usize {
+    let cursor_byte = utf16_to_byte_index(line, cursor_utf16.min(line.encode_utf16().count()));
+    line[cursor_byte..].chars().count()
+}
+
 fn probable_ascii_prefix_noise(ax_text: &str, model_text: &str) -> bool {
     if model_text.is_empty() {
         return false;
@@ -1775,10 +1802,35 @@ impl EntityInputHandler for AgentTerminal {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let mut bounds = self.ime_cursor_bounds(element_bounds, window);
-        if self.ime_marked_text.is_some() {
-            // bounds.size.width is cell_width (from ime_cursor_bounds), reuse it.
-            let cell_width = bounds.size.width.max(px(1.0));
-            bounds.origin.x += cell_width * range_utf16.start as f32;
+        if let Some(marked_text) = self.ime_marked_text.as_ref() {
+            // 候选窗横向偏移按**真实字形宽度**计（COR-5）：渲染用 shape_line 画
+            // 组合串，这里必须用同一把尺子量 range 起点之前的前缀。此前按"每个
+            // UTF-16 单元一个半角格"推算，假名/已上屏汉字（1 单元、双宽）下
+            // 候选窗会向左偏掉组合长度的一半。
+            let prefix = utf16_substring(
+                marked_text,
+                0..range_utf16.start.min(marked_text.encode_utf16().count()),
+            )
+            .unwrap_or_default();
+            if !prefix.is_empty() {
+                let font = crate::render::build_terminal_font(
+                    &self.font_family,
+                    self.font_fallbacks.as_ref(),
+                );
+                let run = gpui::TextRun {
+                    len: prefix.len(),
+                    font,
+                    color: gpui::Hsla::default(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(prefix.into(), self.font_size, &[run], None);
+                bounds.origin.x += shaped.width;
+            }
         }
         Some(bounds)
     }
@@ -1807,9 +1859,23 @@ mod tests {
     use super::{
         ExternalFileDragState, FocusActivationMouseGuard, ax_text_matches_visible_input_context,
         dropped_paths_text, encode_mouse_report, evaluate_paste_risk, probable_ascii_prefix_noise,
-        shell_escape_path,
+        shell_escape_path, tail_chars_after_cursor,
     };
     use alacritty_terminal::term::TermMode;
+
+    /// 回归（COR-4）：光标回退按字符计，不按 UTF-16 单元、不按列宽。
+    #[test]
+    fn tail_chars_counts_characters_not_utf16_units_or_columns() {
+        // "a😀b"：光标在行首，尾部 3 个字符（emoji 是 2 个 UTF-16 单元，但只退 1 次）。
+        assert_eq!(tail_chars_after_cursor("a\u{1F600}b", 0), 3);
+        // 光标在 emoji 之后（utf16 索引 3 = 'a' + 代理对），尾部只剩 'b'。
+        assert_eq!(tail_chars_after_cursor("a\u{1F600}b", 3), 1);
+        // CJK：1 个 UTF-16 单元、2 列宽，但退 1 次。
+        assert_eq!(tail_chars_after_cursor("中文字", 0), 3);
+        assert_eq!(tail_chars_after_cursor("中文字", 1), 2);
+        // 光标越界时安全钳制。
+        assert_eq!(tail_chars_after_cursor("abc", 99), 0);
+    }
 
     /// 回归（SEC-7）：三个条件原本是**与**关系，于是最典型的危险粘贴——纯 ASCII 的
     /// 多行 `curl … | sh`——一条都不满足，完全不触发确认。而粘贴会把 \n 全转成 \r，

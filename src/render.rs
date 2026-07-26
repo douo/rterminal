@@ -376,6 +376,11 @@ impl Render for AgentTerminal {
 
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
                             for image in images.iter() {
+                                // DSP-2：图片只画在它所属的屏上——主屏图片不浮在
+                                // vim/less 之上，alt screen 的预览退出后不残留。
+                                if image.alt_screen != snapshot.alt_screen {
+                                    continue;
+                                }
                                 if image.row >= snapshot.cells.len() as isize
                                     || image.row + image.rows as isize <= 0
                                 {

@@ -20,6 +20,10 @@ pub(crate) struct TerminalImage {
     pub(crate) col: usize,
     pub(crate) cols: usize,
     pub(crate) rows: usize,
+    /// 图片属于主屏还是 alt screen（DSP-2）。两个屏是独立的绘制面：主屏图片
+    /// 不该浮在 vim/less 之上，alt screen 里预览的图片退出后也不该残留在主屏。
+    /// 渲染与滚动/擦除记账都按当前屏过滤。
+    pub(crate) alt_screen: bool,
     pub(crate) image: Arc<RenderImage>,
 }
 
@@ -57,6 +61,7 @@ impl TerminalImages {
         image: &SixelImage,
         cell_width: Pixels,
         line_height: Pixels,
+        alt_screen: bool,
         processor: &mut Processor<StdSyncHandler>,
         term: &mut Term<T>,
     ) -> bool {
@@ -71,6 +76,7 @@ impl TerminalImages {
             col: image.col,
             cols: occupied_cols,
             rows: occupied_rows,
+            alt_screen,
             image: render_image,
         });
         if self.images.len() > Self::MAX_IMAGES {
@@ -83,14 +89,33 @@ impl TerminalImages {
     }
 
     /// Move images intersecting `[region_top, region_bottom)` by `delta` rows,
-    /// dropping any pushed fully out of the region.
-    pub(crate) fn scroll_region(&mut self, region_top: usize, region_bottom: usize, delta: i32) {
-        scroll_images_in_region(&mut self.images, region_top, region_bottom, delta);
+    /// dropping any pushed fully out of the region. Only images on the given
+    /// screen are affected: vim scrolling inside the alt screen must not drag
+    /// main-screen images around.
+    pub(crate) fn scroll_region(
+        &mut self,
+        region_top: usize,
+        region_bottom: usize,
+        delta: i32,
+        alt_screen: bool,
+    ) {
+        scroll_images_in_region(
+            &mut self.images,
+            region_top,
+            region_bottom,
+            delta,
+            alt_screen,
+        );
     }
 
-    /// Drop images intersecting `[region_top, region_bottom)`.
-    pub(crate) fn erase_region(&mut self, region_top: usize, region_bottom: usize) {
-        erase_images_in_region(&mut self.images, region_top, region_bottom);
+    /// Drop images on the given screen intersecting `[region_top, region_bottom)`.
+    pub(crate) fn erase_region(
+        &mut self,
+        region_top: usize,
+        region_bottom: usize,
+        alt_screen: bool,
+    ) {
+        erase_images_in_region(&mut self.images, region_top, region_bottom, alt_screen);
     }
 }
 
@@ -156,6 +181,7 @@ fn scroll_images_in_region(
     region_top: usize,
     region_bottom: usize,
     delta: i32,
+    alt_screen: bool,
 ) {
     if delta == 0 || region_top >= region_bottom {
         return;
@@ -167,6 +193,9 @@ fn scroll_images_in_region(
     *images = images
         .drain(..)
         .filter_map(|mut image| {
+            if image.alt_screen != alt_screen {
+                return Some(image);
+            }
             let image_bottom = image.row + image.rows as isize;
             let intersects_region = image.row < region_bottom && image_bottom > region_top;
             if !intersects_region {
@@ -188,6 +217,7 @@ fn erase_images_in_region(
     images: &mut Vec<TerminalImage>,
     region_top: usize,
     region_bottom: usize,
+    alt_screen: bool,
 ) {
     if region_top >= region_bottom {
         return;
@@ -196,6 +226,9 @@ fn erase_images_in_region(
     let region_top = region_top as isize;
     let region_bottom = region_bottom as isize;
     images.retain(|image| {
+        if image.alt_screen != alt_screen {
+            return true;
+        }
         let image_bottom = image.row + image.rows as isize;
         !(image.row < region_bottom && image_bottom > region_top)
     });
@@ -300,6 +333,7 @@ mod tests {
             col: 0,
             cols: 1,
             rows: 3,
+            alt_screen: false,
             image: dummy_render_image(),
         }];
 
@@ -313,6 +347,7 @@ mod tests {
                 0,
                 usize::MAX / 2,
                 -((new_history_size - old_history_size) as i32),
+                false,
             );
         }
 
@@ -326,6 +361,7 @@ mod tests {
                 0,
                 usize::MAX / 2,
                 -((next_history_size - new_history_size) as i32),
+                false,
             );
         }
 
@@ -339,6 +375,7 @@ mod tests {
                 0,
                 usize::MAX / 2,
                 -((final_history_size - next_history_size) as i32),
+                false,
             );
         }
 
@@ -353,6 +390,7 @@ mod tests {
                 col: 0,
                 cols: 1,
                 rows: 2,
+                alt_screen: false,
                 image: dummy_render_image(),
             },
             TerminalImage {
@@ -360,20 +398,55 @@ mod tests {
                 col: 0,
                 cols: 1,
                 rows: 1,
+                alt_screen: false,
                 image: dummy_render_image(),
             },
         ];
 
-        scroll_images_in_region(&mut images, 1, 4, -1);
+        scroll_images_in_region(&mut images, 1, 4, -1, false);
 
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].row, 1);
         assert_eq!(images[1].row, 5);
 
-        scroll_images_in_region(&mut images, 1, 4, -3);
+        scroll_images_in_region(&mut images, 1, 4, -3, false);
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].row, 5);
+    }
+
+    /// 回归（DSP-2）：滚动/擦除只影响同一屏的图片。vim 在 alt screen 里滚动
+    /// 不能拖动主屏图片，alt screen 的清屏也不能把主屏图片抹掉。
+    #[test]
+    fn scroll_and_erase_only_touch_images_on_the_same_screen() {
+        let mut images = vec![
+            TerminalImage {
+                row: 2,
+                col: 0,
+                cols: 1,
+                rows: 2,
+                alt_screen: false,
+                image: dummy_render_image(),
+            },
+            TerminalImage {
+                row: 2,
+                col: 0,
+                cols: 1,
+                rows: 2,
+                alt_screen: true,
+                image: dummy_render_image(),
+            },
+        ];
+
+        // alt screen 内滚动：只动 alt 图片。
+        scroll_images_in_region(&mut images, 0, 10, -1, true);
+        assert_eq!(images[0].row, 2);
+        assert_eq!(images[1].row, 1);
+
+        // alt screen 内擦除：只删 alt 图片。
+        erase_images_in_region(&mut images, 0, 10, true);
+        assert_eq!(images.len(), 1);
+        assert!(!images[0].alt_screen);
     }
 
     #[test]
@@ -384,6 +457,7 @@ mod tests {
                 col: 0,
                 cols: 1,
                 rows: 2,
+                alt_screen: false,
                 image: dummy_render_image(),
             },
             TerminalImage {
@@ -391,11 +465,12 @@ mod tests {
                 col: 0,
                 cols: 1,
                 rows: 1,
+                alt_screen: false,
                 image: dummy_render_image(),
             },
         ];
 
-        erase_images_in_region(&mut images, 0, 4);
+        erase_images_in_region(&mut images, 0, 4, false);
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].row, 5);

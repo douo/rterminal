@@ -648,19 +648,66 @@ impl AgentTerminal {
                     region_bottom,
                     delta,
                 } => {
-                    self.images.scroll_region(region_top, region_bottom, delta);
+                    let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+                    self.images
+                        .scroll_region(region_top, region_bottom, delta, alt);
                 }
                 PendingTerminalEvent::Erase {
                     region_top,
                     region_bottom,
                 } => {
-                    self.images.erase_region(region_top, region_bottom);
+                    let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+                    self.images.erase_region(region_top, region_bottom, alt);
                 }
             }
         }
     }
 
+    /// 只结算影响图片版图的 Scroll/Erase 事件，Clipboard 类事件保持排队。
+    ///
+    /// 图片入库前（DSP-1）与 resize 后（DSP-3）必须立刻结算：`ingest_batch` 是逐
+    /// chunk 处理、批末才统一 drain 的，如果不在入库前把**之前**积累的 Scroll 先
+    /// 结掉，`seq 30; img2sixel foo.png` 合并进同一批时那些滚动增量会被错误地施加
+    /// 到新图片上——图片额外上移 N 行甚至被判定滚出而丢弃。
+    fn drain_pending_image_events(&mut self) {
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let pending = {
+            let mut guard = self.pending_term_events.lock();
+            std::mem::take(&mut *guard)
+        };
+        let mut kept = Vec::new();
+        for event in pending {
+            match event {
+                PendingTerminalEvent::Scroll {
+                    region_top,
+                    region_bottom,
+                    delta,
+                } => {
+                    self.images
+                        .scroll_region(region_top, region_bottom, delta, alt);
+                }
+                PendingTerminalEvent::Erase {
+                    region_top,
+                    region_bottom,
+                } => {
+                    self.images.erase_region(region_top, region_bottom, alt);
+                }
+                other => kept.push(other),
+            }
+        }
+        if !kept.is_empty() {
+            let mut guard = self.pending_term_events.lock();
+            let arrived_meanwhile = std::mem::take(&mut *guard);
+            *guard = kept;
+            guard.extend(arrived_meanwhile);
+        }
+    }
+
     fn store_sixel_image(&mut self, image: SixelImage) {
+        // DSP-1：先把入库前积累的 Scroll/Erase 结算掉，它们属于旧内容，
+        // 不该作用到马上要入库的这张图片上。
+        self.drain_pending_image_events();
+        let alt_screen = self.term.mode().contains(TermMode::ALT_SCREEN);
         let (width, height, row, col) = (image.width, image.height, image.row, image.col);
         let cell_width = self.cell_width;
         let line_height = self.line_height();
@@ -668,6 +715,7 @@ impl AgentTerminal {
             &image,
             cell_width,
             line_height,
+            alt_screen,
             &mut self.processor,
             &mut self.term,
         );
@@ -937,6 +985,10 @@ impl AgentTerminal {
         self.pty_pixel_size = pty_pixel_size;
         if grid_changed {
             self.term.resize(new_grid);
+            // DSP-3：resize 触发行 reflow / 行进出 scrollback 时会发 Scroll/Erase
+            // 事件。立刻结算而不是等下一次 PTY ingest，否则图片与其预留空白区在
+            // 下一次输出到来之前一直脱节。
+            self.drain_pending_image_events();
         }
 
         if let Some(master) = &self.master

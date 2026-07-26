@@ -30,7 +30,7 @@ use crate::convenience::{
     ConvenienceState,
     input_method::{self, InputModeChangeListener},
 };
-use crate::debug_server::{SharedDebugState, start_debug_http_server};
+use crate::debug_server::{DebugHttpConfig, SharedDebugState, start_debug_http_server};
 use crate::font_fallback::font_fallback_families;
 use crate::input::{ExternalFileDragState, FocusActivationMouseGuard};
 use crate::input_log::InputLogger;
@@ -428,7 +428,25 @@ impl AgentTerminal {
         );
         let processor = Processor::<StdSyncHandler>::new();
 
-        start_debug_http_server(debug.clone(), writer.clone());
+        // 默认不启动：这个接口能往 PTY 写任意字节，等于在用户 shell 里执行任意命令。
+        if cli.debug_http {
+            match DebugHttpConfig::new(cli.debug_http_token.clone(), cli.debug_http_allow_remote) {
+                Some(config) => {
+                    // token 必须让用户看得到，否则开了也用不了。
+                    eprintln!(
+                        "debug http enabled; authenticate with header \"X-Debug-Token: {}\"",
+                        config.token()
+                    );
+                    start_debug_http_server(debug.clone(), writer.clone(), config);
+                }
+                None => {
+                    let message = "refusing to start debug server: could not read /dev/urandom \
+                                   to generate an auth token (pass --debug-http-token to supply one)";
+                    eprintln!("{message}");
+                    debug.set_error(message);
+                }
+            }
+        }
         let input_logger = match cli.input_log_file.as_ref() {
             Some(path) => match InputLogger::new(path, cli.input_log_raw) {
                 Ok(logger) => {

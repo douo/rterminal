@@ -48,6 +48,26 @@ pub(crate) struct CliOptions {
         help = "Treat macOS Option key as plain text input instead of Meta/Alt"
     )]
     pub(crate) no_option_as_meta: bool,
+    /// 默认关闭。这个接口能往 PTY 写任意字节，等于在用户 shell 里执行任意命令，
+    /// 所以必须显式开启，而且开启后强制要求 token（见 --debug-http-token）。
+    #[arg(
+        long,
+        help = "Enable the local debug HTTP server (can inject input into your shell)"
+    )]
+    pub(crate) debug_http: bool,
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        help = "Token required by the debug HTTP server; a random one is generated when omitted"
+    )]
+    pub(crate) debug_http_token: Option<String>,
+    /// AGENT_TUI_DEBUG_ADDR 指向非 loopback 地址时必须同时给这个 flag，
+    /// 否则拒绝启动——把"任意命令执行"接口绑到 0.0.0.0 不该是一次手滑就能做到的事。
+    #[arg(
+        long,
+        help = "Allow the debug HTTP server to bind a non-loopback address (dangerous)"
+    )]
+    pub(crate) debug_http_allow_remote: bool,
 }
 
 #[cfg(test)]
@@ -101,6 +121,28 @@ mod tests {
             cli.input_log_file.as_deref(),
             Some(std::path::Path::new("/tmp/agent-input.jsonl"))
         );
+    }
+
+    /// 这个接口能往用户 shell 注入任意命令，默认必须是关的。
+    #[test]
+    fn debug_http_is_disabled_by_default() {
+        let cli = parse_cli_options_from(Vec::<String>::new());
+        assert!(!cli.debug_http);
+        assert!(cli.debug_http_token.is_none());
+        assert!(!cli.debug_http_allow_remote);
+    }
+
+    #[test]
+    fn debug_http_flags_parse() {
+        let cli = parse_cli_options_from(vec![
+            "--debug-http".to_string(),
+            "--debug-http-token".to_string(),
+            "s3cret".to_string(),
+            "--debug-http-allow-remote".to_string(),
+        ]);
+        assert!(cli.debug_http);
+        assert_eq!(cli.debug_http_token.as_deref(), Some("s3cret"));
+        assert!(cli.debug_http_allow_remote);
     }
 
     #[test]

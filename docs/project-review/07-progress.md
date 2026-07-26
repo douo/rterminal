@@ -178,8 +178,43 @@
 - 视觉验收（`seq 30; img2sixel`、`\e[1;7;31m`、CJK 块光标）依赖真实 GUI，
   单元测试已覆盖对应的纯函数语义，端到端确认待人工跑 `scripts/run.sh`。
 
+## 阶段 4 · 性能 —— 已完成
+
+| 条目 | 状态 | 提交 |
+|---|---|---|
+| PERF-1a 每帧两次整屏深拷贝 → Arc 克隆 | 已修 | `1fe0a22` |
+| PERF-1b 逐 cell shape → 按 run 合并整段 shape | 已修 | `1fe0a22` |
+| PERF-1c prepaint/paint 重复测量字宽 | 已修 | `1fe0a22` |
+| PERF-3 摄取侧 URL 扫描 / debug 文本重建惰性化 | 已修 | `1fe0a22` |
+| PERF-2 系统字体扫描移出首窗口路径 | 已修 | `1fe0a22` |
+| （冒烟发现）私有点前缀字体进 fallback 表 | 已修 | `d679499` |
+
+### 验收记录
+
+- `scripts/check.sh` 全绿（324 测试）。
+- 真实应用冒烟（`--debug-http` 注入驱动）：注入含 CJK/emoji/SGR 颜色的命令，
+  `/debug/state` 回显逐字正确；修复点前缀字体后 CoreText 警告从成串降到 0。
+- run 合并的正确性边界都写进了 `paint_merged_run` 的文档注释：宽字符 /
+  zerowidth / 强制双宽仍单独 shape（force_width 把第 i 个字形钉在
+  i×cell_width，只对"每字形一列"成立）；空白只延续无装饰 run。
+
+### 遗留与偏差
+
+- **计划要求的"CPU 占用相对基线明显下降"没有量化数字。** 基线测量需要在
+  改动前的构建上跑 `yes` 洪泛并采样 CPU，改完后同条件对比——审查时未预先
+  采基线，此时补测只能测"现在"，没有对照。结构性依据是明确的（每帧堆克隆
+  从 ~5 万次降到 2 次 Arc 克隆、shape 调用从 ~2000 次/帧降到每行数个 run、
+  LineLayoutCache 键空间大幅缩小），如需数字建议后续用 Instruments 对
+  `1fe0a22` 前后两个构建各采一次。
+- **视觉截图验证被 macOS 屏幕录制权限（TCC）拦截**——`screencapture` 在本
+  shell 上下文无授权。文本层（/debug/state）已验证；像素层的最终确认需要
+  用户自己看一眼窗口（重点：粗体/颜色 run 边界、CJK 与 emoji 间距、
+  下划线不画穿空格）。
+- PERF-2 的换装依赖 100ms 周期任务：扫描完成后最迟 100ms 换上完整
+  fallback 表，首帧到换装之间罕见符号（Nerd Font 图标等）可能短暂用
+  保守表渲染。
+
 ## 下一步
 
-阶段 4（性能）：PERF-1a snapshot 改 Arc、PERF-1b 按 run 合并 shape、
-PERF-1c 删重复测量、PERF-3 摄取侧惰性化、PERF-2 字体扫描后移。
-ARCH-4 已完成，render 现在是只读的，改动安全。
+阶段 5（结构与工程化收尾）：ARCH-3 字段分组、SEC-4 debug server 生命周期、
+ENG-8~13 文档与工程化、ENG-3 future-incompat 评估。

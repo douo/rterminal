@@ -30,7 +30,7 @@ use crate::convenience::{
     input_method::{self, InputModeChangeListener},
 };
 use crate::debug_server::{
-    DebugHttpConfig, DebugInputSink, SharedDebugState, start_debug_http_server,
+    DebugHttpConfig, DebugInputSink, DebugTabHandle, SharedDebugState, register_debug_http_tab,
 };
 use crate::font_fallback::font_fallback_families;
 pub(crate) use crate::grid_cells::{CellSnapshot, ScreenSnapshot, SelectionPoint};
@@ -444,6 +444,8 @@ pub(crate) struct AgentTerminal {
     pub(crate) debug: SharedDebugState,
     /// debug HTTP 是否真的在跑：为 false 时跳过每 batch 的整屏文本行重建（PERF-3）。
     debug_http_enabled: bool,
+    /// 进程级 debug server 上本 tab 的会话句柄，Drop 即注销（SEC-4）。
+    _debug_http_tab: Option<DebugTabHandle>,
     pending_term_events: Arc<Mutex<Vec<PendingTerminalEvent>>>,
     pub(crate) _window_bounds_sub: Option<Subscription>,
     pub(crate) _window_activation_sub: Option<Subscription>,
@@ -550,6 +552,7 @@ impl AgentTerminal {
         // 默认不启动：这个接口能往 PTY 写任意字节，等于在用户 shell 里执行任意命令。
         let mut debug_input_rx = None;
         let mut debug_http_enabled = false;
+        let mut debug_http_tab = None;
         if cli.debug_http {
             match DebugHttpConfig::new(cli.debug_http_token.clone(), cli.debug_http_allow_remote) {
                 Some(config) => {
@@ -562,7 +565,9 @@ impl AgentTerminal {
                     let (sink, rx) = DebugInputSink::channel();
                     debug_input_rx = Some(rx);
                     debug_http_enabled = true;
-                    start_debug_http_server(debug.clone(), Some(sink), config);
+                    // 句柄随本终端存活，Drop 即从进程级 server 注销会话（SEC-4）。
+                    debug_http_tab =
+                        Some(register_debug_http_tab(debug.clone(), Some(sink), config));
                 }
                 None => {
                     let message = "refusing to start debug server: could not read /dev/urandom \
@@ -644,6 +649,7 @@ impl AgentTerminal {
             shell_exited: false,
             debug,
             debug_http_enabled,
+            _debug_http_tab: debug_http_tab,
             pending_term_events,
             _window_bounds_sub: None,
             _window_activation_sub: None,

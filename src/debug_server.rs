@@ -319,9 +319,125 @@ impl SharedDebugState {
     }
 }
 
-pub(crate) fn start_debug_http_server(
+/// 一个 tab 在 debug HTTP 上的会话。
+#[derive(Clone)]
+struct TabSession {
     debug: SharedDebugState,
     writer: Option<DebugInputSink>,
+}
+
+/// 进程级 tab 注册表（SEC-4）。
+///
+/// 此前每个 tab 各起一个 HTTP server：`incoming_requests()` 无终止循环、
+/// tiny_http 无 shutdown 通道，tab 关闭后线程、端口、writer 全部泄漏，
+/// 注入还会写向"已关闭"的会话；开满 100 tab 后端口耗尽。现在整个进程只有
+/// 一个 server，tab 经 [`DebugTabHandle`] 注册，句柄随 `AgentTerminal` 一起
+/// Drop 时注销会话。
+pub(crate) struct DebugTabRegistry {
+    tabs: Mutex<std::collections::BTreeMap<u64, TabSession>>,
+    next_id: std::sync::atomic::AtomicU64,
+    listening_addr: Mutex<Option<String>>,
+}
+
+impl DebugTabRegistry {
+    fn new() -> Self {
+        Self {
+            tabs: Mutex::new(std::collections::BTreeMap::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            listening_addr: Mutex::new(None),
+        }
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        debug: SharedDebugState,
+        writer: Option<DebugInputSink>,
+    ) -> DebugTabHandle {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(addr) = self.listening_addr.lock().clone() {
+            debug.set_listening_addr(format!("{addr}/debug/tabs/{id}"));
+        }
+        self.tabs.lock().insert(id, TabSession { debug, writer });
+        DebugTabHandle {
+            registry: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn set_listening_addr(&self, addr: String) {
+        for (id, session) in self.tabs.lock().iter() {
+            session
+                .debug
+                .set_listening_addr(format!("{addr}/debug/tabs/{id}"));
+        }
+        *self.listening_addr.lock() = Some(addr);
+    }
+
+    fn get(&self, id: u64) -> Option<TabSession> {
+        self.tabs.lock().get(&id).cloned()
+    }
+
+    /// 旧的无 tab 前缀路径兼容：路由到编号最小的存活 tab。
+    fn first(&self) -> Option<TabSession> {
+        self.tabs.lock().values().next().cloned()
+    }
+
+    fn list_json(&self) -> String {
+        let tabs = self.tabs.lock();
+        let entries: Vec<serde_json::Value> = tabs
+            .iter()
+            .map(|(id, session)| {
+                serde_json::json!({
+                    "id": id,
+                    "endpoints": format!("/debug/tabs/{id}/{{state,screen,input,replace-line,note}}"),
+                    "status": session.debug.status_summary(),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({ "tabs": entries }))
+            .unwrap_or_else(|_| "{\"error\":\"serialize failed\"}".to_string())
+    }
+}
+
+/// tab 会话句柄：随 `AgentTerminal` 存活，Drop 即注销，注入不再可能写向已
+/// 关闭的会话。
+pub(crate) struct DebugTabHandle {
+    registry: Arc<DebugTabRegistry>,
+    id: u64,
+}
+
+impl Drop for DebugTabHandle {
+    fn drop(&mut self) {
+        self.registry.tabs.lock().remove(&self.id);
+    }
+}
+
+static GLOBAL_DEBUG_REGISTRY: std::sync::OnceLock<Arc<DebugTabRegistry>> =
+    std::sync::OnceLock::new();
+static DEBUG_SERVER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 注册一个 tab 并在首次调用时启动进程级 debug HTTP server。
+pub(crate) fn register_debug_http_tab(
+    debug: SharedDebugState,
+    writer: Option<DebugInputSink>,
+    config: DebugHttpConfig,
+) -> DebugTabHandle {
+    let registry = GLOBAL_DEBUG_REGISTRY
+        .get_or_init(|| Arc::new(DebugTabRegistry::new()))
+        .clone();
+    let handle = registry.register(debug.clone(), writer);
+
+    if !DEBUG_SERVER_STARTED.swap(true, Ordering::SeqCst) {
+        start_debug_http_server(registry, debug, config);
+    }
+
+    handle
+}
+
+fn start_debug_http_server(
+    registry: Arc<DebugTabRegistry>,
+    debug: SharedDebugState,
     config: DebugHttpConfig,
 ) {
     if let Some(addr) = std::env::var("AGENT_TUI_DEBUG_ADDR")
@@ -339,11 +455,129 @@ pub(crate) fn start_debug_http_server(
             return;
         }
 
-        start_debug_http_server_at_addr(debug, writer, addr, config);
+        spawn_debug_server_thread(registry, debug, Some(addr), config);
         return;
     }
 
-    start_debug_http_server_on_default_port_range(debug, writer, config);
+    spawn_debug_server_thread(registry, debug, None, config);
+}
+
+fn spawn_debug_server_thread(
+    registry: Arc<DebugTabRegistry>,
+    debug: SharedDebugState,
+    fixed_addr: Option<String>,
+    config: DebugHttpConfig,
+) {
+    let _ = thread::Builder::new()
+        .name("agent-debug-http".to_string())
+        .spawn(move || {
+            let (server, addr) = match fixed_addr {
+                Some(addr) => match Server::http(&addr) {
+                    Ok(server) => (server, addr),
+                    Err(err) => {
+                        debug.set_error(format!("failed to start debug server on {addr}: {err}"));
+                        return;
+                    }
+                },
+                None => {
+                    let mut bound = None;
+                    let mut last_error = None;
+                    for _ in DEBUG_HTTP_DEFAULT_PORT_START..=DEBUG_HTTP_DEFAULT_PORT_END {
+                        let addr = next_default_debug_http_addr();
+                        match Server::http(&addr) {
+                            Ok(server) => {
+                                bound = Some((server, addr));
+                                break;
+                            }
+                            Err(err) => {
+                                last_error =
+                                    Some(format!("failed to start debug server on {addr}: {err}"));
+                            }
+                        }
+                    }
+                    match bound {
+                        Some(pair) => pair,
+                        None => {
+                            debug.set_error(last_error.unwrap_or_else(|| {
+                                format!(
+                                    "failed to start debug server in {DEBUG_HTTP_DEFAULT_HOST}:{}-{}",
+                                    DEBUG_HTTP_DEFAULT_PORT_START, DEBUG_HTTP_DEFAULT_PORT_END
+                                )
+                            }));
+                            return;
+                        }
+                    }
+                }
+            };
+
+            registry.set_listening_addr(addr.clone());
+            if should_log_debug_http_start() {
+                eprintln!("debug http listening on http://{addr}");
+            }
+
+            for mut request in server.incoming_requests() {
+                let method = request.method().as_str().to_string();
+                let path = request.url().split('?').next().unwrap_or("/").to_string();
+
+                let response = match reject_unauthorized(&request, &config) {
+                    Some(rejection) => rejection,
+                    None => dispatch_debug_request(&registry, &mut request, &method, &path),
+                };
+
+                let _ = request.respond(response);
+            }
+        });
+}
+
+/// 按路径把请求路由到 tab 会话。
+///
+/// - `/debug/tabs` → 会话列表
+/// - `/debug/tabs/{id}/xxx` → 指定 tab
+/// - `/debug/xxx`（旧路径）→ 编号最小的存活 tab
+fn dispatch_debug_request(
+    registry: &DebugTabRegistry,
+    request: &mut tiny_http::Request,
+    method: &str,
+    path: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    if method == "GET" && (path == "/debug/tabs" || path == "/debug/tabs/") {
+        return text_response(200, "application/json; charset=utf-8", registry.list_json());
+    }
+
+    if let Some(rest) = path.strip_prefix("/debug/tabs/") {
+        let (id_part, endpoint) = match rest.split_once('/') {
+            Some((id, endpoint)) => (id, endpoint),
+            None => (rest, ""),
+        };
+        let Ok(id) = id_part.parse::<u64>() else {
+            return text_response(404, "text/plain; charset=utf-8", "unknown tab\n");
+        };
+        let Some(session) = registry.get(id) else {
+            return text_response(404, "text/plain; charset=utf-8", "tab is gone\n");
+        };
+        session.debug.record_http_request();
+        let mapped_path = format!("/debug/{}", endpoint.trim_end_matches('/'));
+        let mapped_path = mapped_path.trim_end_matches('/');
+        return handle_debug_request(
+            request,
+            method,
+            mapped_path,
+            &session.debug,
+            session.writer.as_ref(),
+        );
+    }
+
+    let Some(session) = registry.first() else {
+        return text_response(503, "text/plain; charset=utf-8", "no live tabs\n");
+    };
+    session.debug.record_http_request();
+    handle_debug_request(
+        request,
+        method,
+        path,
+        &session.debug,
+        session.writer.as_ref(),
+    )
 }
 
 /// 解析 `AGENT_TUI_DEBUG_ADDR` 并要求它落在 loopback 上。
@@ -371,37 +605,6 @@ fn addr_is_loopback(addr: &str) -> bool {
     }
 }
 
-fn start_debug_http_server_on_default_port_range(
-    debug: SharedDebugState,
-    writer: Option<DebugInputSink>,
-    config: DebugHttpConfig,
-) {
-    let _ = thread::Builder::new()
-        .name("agent-debug-http".to_string())
-        .spawn(move || {
-            let mut last_error = None;
-            for _ in DEBUG_HTTP_DEFAULT_PORT_START..=DEBUG_HTTP_DEFAULT_PORT_END {
-                let addr = next_default_debug_http_addr();
-                match Server::http(&addr) {
-                    Ok(server) => {
-                        serve_debug_http(server, debug, writer, addr, config);
-                        return;
-                    }
-                    Err(err) => {
-                        last_error = Some(format!("failed to start debug server on {addr}: {err}"));
-                    }
-                }
-            }
-
-            debug.set_error(last_error.unwrap_or_else(|| {
-                format!(
-                    "failed to start debug server in {DEBUG_HTTP_DEFAULT_HOST}:{}-{}",
-                    DEBUG_HTTP_DEFAULT_PORT_START, DEBUG_HTTP_DEFAULT_PORT_END
-                )
-            }));
-        });
-}
-
 fn next_default_debug_http_addr() -> String {
     let port = NEXT_DEBUG_HTTP_PORT
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -423,53 +626,19 @@ fn next_default_debug_http_addr() -> String {
     format!("{DEBUG_HTTP_DEFAULT_HOST}:{port}")
 }
 
+/// 在指定地址起一个**独立注册表**的 server（仅测试用）。
+/// 生产路径请用 [`register_debug_http_tab`]。
+#[cfg(test)]
 pub(crate) fn start_debug_http_server_at_addr(
     debug: SharedDebugState,
     writer: Option<DebugInputSink>,
     addr: String,
     config: DebugHttpConfig,
 ) {
-    let _ = thread::Builder::new()
-        .name("agent-debug-http".to_string())
-        .spawn(move || {
-            let server = match Server::http(&addr) {
-                Ok(server) => server,
-                Err(err) => {
-                    debug.set_error(format!("failed to start debug server on {addr}: {err}"));
-                    return;
-                }
-            };
-
-            serve_debug_http(server, debug, writer, addr, config);
-        });
-}
-
-fn serve_debug_http(
-    server: Server,
-    debug: SharedDebugState,
-    writer: Option<DebugInputSink>,
-    addr: String,
-    config: DebugHttpConfig,
-) {
-    debug.set_listening_addr(addr.clone());
-    if should_log_debug_http_start() {
-        eprintln!("debug http listening on http://{addr}");
-    }
-
-    for mut request in server.incoming_requests() {
-        debug.record_http_request();
-        let method = request.method().as_str().to_string();
-        let path = request.url().split('?').next().unwrap_or("/").to_string();
-
-        let response = match reject_unauthorized(&request, &config) {
-            Some(rejection) => rejection,
-            None => handle_debug_request(&mut request, &method, &path, &debug, writer.as_ref()),
-        };
-
-        if let Err(err) = request.respond(response) {
-            debug.set_error(format!("failed to send HTTP response: {err}"));
-        }
-    }
+    let registry = Arc::new(DebugTabRegistry::new());
+    // 句柄泄漏是有意的：这条路径的会话与进程同生命周期。
+    std::mem::forget(registry.register(debug.clone(), writer));
+    spawn_debug_server_thread(registry, debug, Some(addr), config);
 }
 
 /// 在分派到任何端点之前统一做准入检查。

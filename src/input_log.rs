@@ -24,7 +24,27 @@ struct LogRecord {
 
 impl InputLogger {
     pub(crate) fn new(path: &Path, raw: bool) -> std::io::Result<Self> {
-        let writer = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // 这个文件装的是用户键入内容。默认权限受 umask 影响（通常 0644），
+        // 也就是同机其他用户可读——对一个可能含密钥、token、命令历史的文件不合适。
+        // 只在**新建**时生效；已存在的文件权限不动，那是用户自己的选择。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let writer = options.open(path)?;
+
+        if raw {
+            // raw 模式逐字记录明文，包括粘贴内容和 IME 提交文本。开启它是个有意识的
+            // 取舍，但必须让用户看到自己开了什么。
+            eprintln!(
+                "warning: --input-log-raw records keystrokes and pasted text verbatim to {} \
+                 (including anything secret you type or paste)",
+                path.display()
+            );
+        }
         let (sender, receiver) = mpsc::channel::<LogRecord>();
 
         let _ = thread::Builder::new()

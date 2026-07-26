@@ -134,6 +134,52 @@
   变为 100ms。对语音工具的读路径无感知差异（人的操作粒度远大于 100ms），
   但若未来有自动化工具高频读 AX，需要把节拍调小或改成"模型变更即推"。
 
+## 阶段 3 · 显示与坐标保真 —— 已完成
+
+| 缺陷 | 状态 | 提交 |
+|---|---|---|
+| COR-4 左箭头按 UTF-16 单元数（emoji 多退一格） | 已修 | `47ccc0d` |
+| COR-5 IME 候选窗按 UTF-16 单元定位 | 已修 | `47ccc0d` |
+| DSP-4 鼠标坐标纯线性除法（hover 与点击错位） | 已修 | `47ccc0d` |
+| DSP-1 sixel 与滚动事件顺序错位致图片偏移（S1） | 已修 | `ead311d` |
+| DSP-2 图片与 alt screen 互相穿透 | 已修 | `ead311d` |
+| DSP-3 resize 后图片与预留区脱节 | 已修 | `ead311d` |
+| DSP-5 BOLD+DIM 返回原色 | 已修 | `51522ac` |
+| DSP-6 Indexed 前景忽略 DIM | 已修 | `51522ac` |
+| DSP-7 INVERSE 在变体应用之前交换 | 已修 | `51522ac` |
+| DSP-8 光标在宽字符上只盖左半格 | 已修 | `51522ac` |
+| DSP-9 IME 文本色硬编码不随主题 | 已修 | `51522ac` |
+| DSP-15 光标灰化判据用 window_active | 已修 | `51522ac` |
+| DSP-11 sixel 空列不计入宽度 | 已修 | `1566eca` |
+| DSP-12 DCS 内裸 0x9c 截断 UTF-8 | 已修 | `1566eca` |
+| DSP-13 measure_cell_width 回退与渲染错位 | 已修 | `1566eca` |
+| DSP-14 本地化家族名交给 CoreText 的失配风险 | 已修 | `1566eca` |
+| COR-12 kitty 三处规范偏差 | 已修 | `80b3184` |
+| COR-13 replacement_range 被忽略致重复输入 | 已修 | `80b3184` |
+| COR-15 空 range / 选区查询退化答案 | 已修 | `80b3184` |
+
+### 验收记录
+
+- `scripts/check.sh` 全绿。主 crate 测试 **129 → 142**，vendored sixel +1（透明列宽度），
+  workspace 合计 **324**。
+- 新增回归测试要点：尾部字符数按 char 计（emoji/CJK）、视觉列↔逻辑列双向映射、
+  滚动/擦除只影响同屏图片、BOLD+DIM/Indexed DIM/INVERSE×BOLD 颜色语义、
+  DCS 内 UTF-8 中的 0x9c 不截断、kitty printable release 上报与 release 无
+  associated text、legacy F3 避开 DSR 冲突。
+
+### 遗留与偏差
+
+- **DSP-10（EL 清行对整行发 Erase、图片"相交即整删"）不在工作计划排期内**，维持现状。
+  它是行为取舍而非明确 bug（提示符重绘会闪掉图片），若要精细化需要给 Erase 事件带
+  列范围，涉及 vendored 事件结构改动，收益低。
+- COR-13 的听写替换路径依赖影子模型的行内 range 语义，而"文档坐标系"对 IME 只有
+  marked text 一段是精确的。已用"调用前是否存在组合"隔离组合提交路径，并以
+  range 越界检查兜底；真实听写场景仍需人工验证（同阶段 1 的 gpui 脚手架缺口）。
+- 视觉验收（`seq 30; img2sixel`、`\e[1;7;31m`、CJK 块光标）依赖真实 GUI，
+  单元测试已覆盖对应的纯函数语义，端到端确认待人工跑 `scripts/run.sh`。
+
 ## 下一步
 
-阶段 3（显示与坐标保真）：COR-4/COR-5/DSP-4 现在只需各改一处。
+阶段 4（性能）：PERF-1a snapshot 改 Arc、PERF-1b 按 run 合并 shape、
+PERF-1c 删重复测量、PERF-3 摄取侧惰性化、PERF-2 字体扫描后移。
+ARCH-4 已完成，render 现在是只读的，改动安全。

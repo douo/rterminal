@@ -106,9 +106,34 @@
 - **写队列满时会丢弃并打日志**，而不是阻塞。取舍理由：那种情况意味着前台程序真的
   不读 stdin 了，这次写本来也到不了子进程；静默堆积更糟。
 
+## 阶段 2 · 去重 —— 已完成
+
+| 条目 | 状态 | 提交 |
+|---|---|---|
+| ARCH-2 cell 语义 4 份拷贝 → 1 份（新模块 `grid_cells.rs`） | 已修 | `88b5b75` |
+| ENG-6b 收拢后的唯一实现补单元测试（宽字符/emoji/zerowidth/选区） | 已修 | `88b5b75` |
+| ARCH-4 AX 同步与输入法刷新搬出 `Render::render` | 已修 | `03d8754` |
+
+### 验收记录
+
+- `grep -rn "fn cell_advance_cols" src/` → 1 处定义（grid_cells.rs）；
+  `row_text_without_wide_spacers`、选区三件套、`build_terminal_font`、`palette_for`、
+  line_height 公式同样各剩 1 处。
+- terminal.rs 两处 85 行的网格转换循环各缩成 5 行，共用 `snapshot_cell()`。
+- `Render::render` 内无模型写操作；AX 同步改由 100ms 周期任务驱动，
+  外部 AX 覆写的最大发现延迟从"取决于是否有帧"变为固定 100ms。
+- `scripts/check.sh` 全绿；主 crate 测试 **120 → 129**，workspace 合计 **310**。
+
+### 遗留与偏差
+
+- 逐 cell paint 循环（render.rs vs snapshot_tab.rs，~90 行 ×2）**未合并**：
+  两边的选区来源、palette 字段、滚动窗口逻辑不同，硬抽会得到一个带 6 个参数的
+  闭包地狱。它属于渲染热路径，留给阶段 4 的 PERF-1b（按 run 合并 shape）时
+  一并重写——那时循环体本身就要换掉，先合并是白做。
+- AX 同步从"每帧"改为"每 100ms"是行为变化：发布模型 → AX 的延迟上限从一帧
+  变为 100ms。对语音工具的读路径无感知差异（人的操作粒度远大于 100ms），
+  但若未来有自动化工具高频读 AX，需要把节拍调小或改成"模型变更即推"。
+
 ## 下一步
 
-阶段 2（去重 ARCH-2 / ARCH-4）**必须先于**阶段 3。理由见
-[06-work-plan.md](06-work-plan.md) 元原则 2：COR-4 / COR-5 / DSP-4 是同一类错误
-（列宽 vs 字符数 vs UTF-16 单元 vs 像素除法），之所以能各自独立写错，是因为
-`cell_advance_cols` 有 4 份拷贝。先统一再修，否则修 3 处漏 1 处。
+阶段 3（显示与坐标保真）：COR-4/COR-5/DSP-4 现在只需各改一处。

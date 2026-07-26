@@ -68,9 +68,7 @@ fn link_hover_bounds(
     snapshot: &crate::terminal::ScreenSnapshot,
     bounds: Bounds<Pixels>,
     window: &mut Window,
-    font_family: &str,
-    font_fallbacks: Option<&FontFallbacks>,
-    font_size: Pixels,
+    cell_width: Pixels,
     line_height: Pixels,
 ) -> Option<Bounds<Pixels>> {
     let mouse = window.mouse_position();
@@ -78,8 +76,7 @@ fn link_hover_bounds(
         return None;
     }
 
-    let cell_width =
-        measure_cell_width(window, font_family, font_fallbacks, font_size).max(px(1.0));
+    let cell_width = cell_width.max(px(1.0));
     let dynamic_padding_y =
         terminal_content_padding_y(bounds.size.height, line_height, snapshot.cells.len());
     let origin = bounds.origin + point(TEXT_PADDING_X, dynamic_padding_y);
@@ -156,6 +153,75 @@ struct TerminalCanvasPrepaint {
     link_hover_hitbox: Option<Hitbox>,
 }
 
+/// 相邻 cell 能否并进同一个 shaping run 的样式判据（PERF-1b）。
+/// `color` 已经把"链接用链接色"折叠进来，所以 underline 颜色也由它决定。
+#[derive(Clone, Copy, PartialEq)]
+struct RunStyleKey {
+    bold: bool,
+    italic: bool,
+    color: Hsla,
+    underline: bool,
+    undercurl: bool,
+    strikethrough: bool,
+    link: bool,
+}
+
+/// 把一段合并后的同样式文本一次 shape、一次 paint。
+///
+/// 只接受"每个字形恰好占一个逻辑列"的 run（单列宽、无 zerowidth、非强制双宽），
+/// 因为 `force_width` 会把第 i 个字形钉在 `i × cell_width`——宽字符/组合字符
+/// 必须继续走单 cell 路径。
+#[allow(clippy::too_many_arguments)]
+fn paint_merged_run(
+    window: &mut Window,
+    cx: &mut gpui::App,
+    mono: &Font,
+    run_template: &gpui::TextRun,
+    key: RunStyleKey,
+    text: String,
+    origin_x: Pixels,
+    y: Pixels,
+    font_size: Pixels,
+    cell_width: Pixels,
+    line_height: Pixels,
+) {
+    let mut font = mono.clone();
+    if key.bold {
+        font.weight = FontWeight::BOLD;
+    }
+    if key.italic {
+        font.style = FontStyle::Italic;
+    }
+    let underline = (key.link || key.underline).then_some(gpui::UnderlineStyle {
+        color: Some(key.color),
+        thickness: px(1.0),
+        wavy: key.undercurl,
+    });
+    let strikethrough = key.strikethrough.then_some(gpui::StrikethroughStyle {
+        color: Some(key.color),
+        thickness: px(1.0),
+    });
+    let run = gpui::TextRun {
+        len: text.len(),
+        font,
+        color: key.color,
+        underline,
+        strikethrough,
+        ..run_template.clone()
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text.into(), font_size, &[run], Some(cell_width));
+    let _ = shaped.paint(
+        point(origin_x, y),
+        line_height,
+        gpui::TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
 pub(crate) fn palette_for(theme: Theme) -> RenderPalette {
     match theme {
         Theme::Default => RenderPalette {
@@ -206,6 +272,9 @@ impl Render for AgentTerminal {
         let font_fallbacks = self.font_fallbacks.clone();
         let font_size = self.font_size;
         let line_height = self.line_height();
+        // PERF-1c：网格尺寸计算时已经测过一次字宽并存进 self.cell_width，
+        // prepaint/paint 直接复用，不再各自 resolve_font + advance。
+        let cell_width = self.cell_width.max(px(1.0));
         let note = self.debug.note();
         let selection = self.selection_bounds();
         let input_mode = self.convenience_state.input_mode();
@@ -224,8 +293,6 @@ impl Render for AgentTerminal {
         let canvas_font_fallbacks = font_fallbacks.clone();
         let canvas_bounds_shared = self.canvas_bounds.clone();
         let canvas_snapshot = snapshot.clone();
-        let canvas_font_family_for_prepaint = font_family.clone();
-        let canvas_font_fallbacks_for_prepaint = font_fallbacks.clone();
 
         let status_line = if let Some(note) = note {
             format!("agent terminal | {} | {} | note: {}", shell, status, note)
@@ -252,9 +319,7 @@ impl Render for AgentTerminal {
                             &canvas_snapshot,
                             bounds,
                             window,
-                            &canvas_font_family_for_prepaint,
-                            canvas_font_fallbacks_for_prepaint.as_ref(),
-                            font_size,
+                            cell_width,
                             line_height,
                         )
                         .map(|bounds| window.insert_hitbox(bounds, HitboxBehavior::Normal));
@@ -284,12 +349,6 @@ impl Render for AgentTerminal {
                         };
 
                         let font_pixels = font_size;
-                        let font_id = window.text_system().resolve_font(&mono);
-                        let cell_width = window
-                            .text_system()
-                            .advance(font_id, font_pixels, 'M')
-                            .map(|advance| advance.width)
-                            .unwrap_or(px(8.0));
                         let link_color: Hsla = rgb(0x6aa8ff).into();
                         if let Some(hitbox) = prepaint.link_hover_hitbox.as_ref()
                             && hitbox.is_hovered(window)
@@ -309,12 +368,15 @@ impl Render for AgentTerminal {
                             let y = origin.y + row_index as f32 * line_height;
                             let mut covered_until_col = 0usize;
                             let mut extra_visual_cols = 0f32;
+                            // (样式, 已积累文本, 起始视觉列)。同样式的相邻单列 cell
+                            // 并成一个 run 整段 shape（PERF-1b），替代逐 cell 一次
+                            // String 分配 + 一次 shape_line（80×24 满屏约 2000 次/帧）。
+                            let mut pending: Option<(RunStyleKey, String, f32)> = None;
 
                             for (col_index, cell) in row.iter().enumerate() {
                                 let is_spacer_col = col_index < covered_until_col;
-                                let x =
-                                    origin.x + (col_index as f32 + extra_visual_cols) * cell_width;
-                                let cell_origin = point(x, y);
+                                let x_cols = col_index as f32 + extra_visual_cols;
+                                let cell_origin = point(origin.x + x_cols * cell_width, y);
                                 let cell_width_px =
                                     cell_width.max(px(2.0)) * cell.width_cols as f32;
 
@@ -335,68 +397,156 @@ impl Render for AgentTerminal {
                                     ));
                                 }
 
-                                if !is_spacer_col && !cell.is_blank() {
-                                    let cell_text = cell.text();
-                                    let underline = if cell.link.is_some() || cell.underline {
-                                        Some(gpui::UnderlineStyle {
-                                            color: Some(if cell.link.is_some() {
-                                                link_color
-                                            } else {
-                                                cell.fg
-                                            }),
-                                            thickness: px(1.0),
-                                            wavy: cell.undercurl,
-                                        })
-                                    } else {
-                                        None
-                                    };
-                                    let mut font = mono.clone();
-                                    if cell.bold {
-                                        font.weight = FontWeight::BOLD;
-                                    }
-                                    if cell.italic {
-                                        font.style = FontStyle::Italic;
-                                    }
-                                    let strikethrough =
-                                        cell.strikethrough.then_some(gpui::StrikethroughStyle {
-                                            color: Some(cell.fg),
-                                            thickness: px(1.0),
-                                        });
-                                    let run = gpui::TextRun {
-                                        len: cell_text.len(),
-                                        font,
-                                        color: if cell.link.is_some() {
-                                            link_color
-                                        } else {
-                                            cell.fg
-                                        },
-                                        underline,
-                                        strikethrough,
-                                        ..run_template.clone()
-                                    };
-                                    let shaped = window.text_system().shape_line(
-                                        cell_text.into(),
-                                        font_pixels,
-                                        &[run],
-                                        Some(cell_width_px),
-                                    );
-                                    let _ = shaped.paint(
-                                        cell_origin,
-                                        line_height,
-                                        gpui::TextAlign::Left,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
-                                }
-
                                 if !is_spacer_col {
+                                    // 每字形恰占一列才能并 run；宽字符 / zerowidth /
+                                    // 强制双宽仍单独 shape（见 paint_merged_run 文档）。
+                                    let mergeable = cell.width_cols <= 1
+                                        && cell.zerowidth.is_empty()
+                                        && !cell.expands_layout;
+                                    if mergeable {
+                                        if cell.is_blank() {
+                                            // 空白只延续无装饰的 run，否则下划线 /
+                                            // 删除线会画穿空格。
+                                            match pending.as_mut() {
+                                                Some((key, text, _))
+                                                    if !key.underline
+                                                        && !key.link
+                                                        && !key.strikethrough =>
+                                                {
+                                                    text.push(' ');
+                                                }
+                                                _ => {
+                                                    if let Some((key, text, start_x_cols)) =
+                                                        pending.take()
+                                                    {
+                                                        paint_merged_run(
+                                                            window,
+                                                            cx,
+                                                            &mono,
+                                                            &run_template,
+                                                            key,
+                                                            text,
+                                                            origin.x + start_x_cols * cell_width,
+                                                            y,
+                                                            font_pixels,
+                                                            cell_width,
+                                                            line_height,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let key = RunStyleKey {
+                                                bold: cell.bold,
+                                                italic: cell.italic,
+                                                color: if cell.link.is_some() {
+                                                    link_color
+                                                } else {
+                                                    cell.fg
+                                                },
+                                                underline: cell.underline,
+                                                undercurl: cell.undercurl,
+                                                strikethrough: cell.strikethrough,
+                                                link: cell.link.is_some(),
+                                            };
+                                            match pending.as_mut() {
+                                                Some((pending_key, text, _))
+                                                    if *pending_key == key =>
+                                                {
+                                                    text.push(cell.ch);
+                                                }
+                                                _ => {
+                                                    if let Some((key, text, start_x_cols)) =
+                                                        pending.take()
+                                                    {
+                                                        paint_merged_run(
+                                                            window,
+                                                            cx,
+                                                            &mono,
+                                                            &run_template,
+                                                            key,
+                                                            text,
+                                                            origin.x + start_x_cols * cell_width,
+                                                            y,
+                                                            font_pixels,
+                                                            cell_width,
+                                                            line_height,
+                                                        );
+                                                    }
+                                                    let mut text = String::new();
+                                                    text.push(cell.ch);
+                                                    pending = Some((key, text, x_cols));
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        if let Some((key, text, start_x_cols)) = pending.take() {
+                                            paint_merged_run(
+                                                window,
+                                                cx,
+                                                &mono,
+                                                &run_template,
+                                                key,
+                                                text,
+                                                origin.x + start_x_cols * cell_width,
+                                                y,
+                                                font_pixels,
+                                                cell_width,
+                                                line_height,
+                                            );
+                                        }
+                                        if !cell.is_blank() {
+                                            let key = RunStyleKey {
+                                                bold: cell.bold,
+                                                italic: cell.italic,
+                                                color: if cell.link.is_some() {
+                                                    link_color
+                                                } else {
+                                                    cell.fg
+                                                },
+                                                underline: cell.underline,
+                                                undercurl: cell.undercurl,
+                                                strikethrough: cell.strikethrough,
+                                                link: cell.link.is_some(),
+                                            };
+                                            paint_merged_run(
+                                                window,
+                                                cx,
+                                                &mono,
+                                                &run_template,
+                                                key,
+                                                cell.text(),
+                                                cell_origin.x,
+                                                y,
+                                                font_pixels,
+                                                cell_width_px,
+                                                line_height,
+                                            );
+                                        }
+                                    }
+
                                     covered_until_col =
                                         col_index.saturating_add(cell_advance_cols(cell));
                                     if cell.expands_layout && cell.width_cols > 1 {
                                         extra_visual_cols += f32::from(cell.width_cols - 1);
                                     }
                                 }
+                            }
+
+                            if let Some((key, text, start_x_cols)) = pending.take() {
+                                paint_merged_run(
+                                    window,
+                                    cx,
+                                    &mono,
+                                    &run_template,
+                                    key,
+                                    text,
+                                    origin.x + start_x_cols * cell_width,
+                                    y,
+                                    font_pixels,
+                                    cell_width,
+                                    line_height,
+                                );
                             }
                         }
 

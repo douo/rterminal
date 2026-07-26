@@ -204,7 +204,9 @@ pub(crate) struct AgentTerminal {
     pub(crate) processor: Processor<StdSyncHandler>,
     sixel_parser: SixelStreamParser,
     pub(crate) grid_size: GridSize,
-    pub(crate) snapshot: ScreenSnapshot,
+    /// Arc 包裹（PERF-1a）：render 每帧要把快照递进两层 canvas 闭包，
+    /// 深拷贝一个 300×80 网格是每帧约 5 万次 cell 级堆克隆，Arc 克隆是 8 字节。
+    pub(crate) snapshot: Arc<ScreenSnapshot>,
     pub(crate) images: TerminalImages,
     pub(crate) cursor_shape: CursorShape,
     pub(crate) force_vertical_cursor: bool,
@@ -224,6 +226,10 @@ pub(crate) struct AgentTerminal {
     pub(crate) theme: Theme,
     pub(crate) font_family: String,
     pub(crate) font_fallbacks: Option<FontFallbacks>,
+    /// CLI 传入的 fallback 原始表；后台字体扫描完成后用它重建完整 fallback 链。
+    cli_font_fallbacks: Vec<String>,
+    /// 首窗口用的是保守 fallback 表（PERF-2）；扫描完成后换装一次并复位。
+    font_fallbacks_pending_rescan: bool,
     pub(crate) forced_double_width_chars: HashSet<char>,
     pub(crate) font_size: Pixels,
     pub(crate) cell_width: Pixels,
@@ -259,6 +265,8 @@ pub(crate) struct AgentTerminal {
     pub(crate) paste_guard_prompt_open: bool,
     pub(crate) shell_exited: bool,
     pub(crate) debug: SharedDebugState,
+    /// debug HTTP 是否真的在跑：为 false 时跳过每 batch 的整屏文本行重建（PERF-3）。
+    debug_http_enabled: bool,
     pending_term_events: Arc<Mutex<Vec<PendingTerminalEvent>>>,
     pub(crate) _window_bounds_sub: Option<Subscription>,
     pub(crate) _window_activation_sub: Option<Subscription>,
@@ -302,6 +310,8 @@ impl AgentTerminal {
         let focus_handle = cx.focus_handle();
         let font_size = DEFAULT_FONT_SIZE;
         let font_fallbacks = parse_font_fallbacks(&cli.font_fallbacks);
+        // 首次调用时后台扫描大概率还没完成，先用保守表；周期任务里检测完成后换装。
+        let font_fallbacks_pending_rescan = !crate::font_fallback::background_scan_complete();
         let forced_double_width_chars = parse_double_width_chars(&cli.double_width_chars);
         let cell_width =
             measure_cell_width(window, &cli.font_family, font_fallbacks.as_ref(), font_size);
@@ -362,6 +372,7 @@ impl AgentTerminal {
 
         // 默认不启动：这个接口能往 PTY 写任意字节，等于在用户 shell 里执行任意命令。
         let mut debug_input_rx = None;
+        let mut debug_http_enabled = false;
         if cli.debug_http {
             match DebugHttpConfig::new(cli.debug_http_token.clone(), cli.debug_http_allow_remote) {
                 Some(config) => {
@@ -373,6 +384,7 @@ impl AgentTerminal {
                     // 注入走主线程（见 DebugInputSink），不让 HTTP 线程自己写 PTY。
                     let (sink, rx) = DebugInputSink::channel();
                     debug_input_rx = Some(rx);
+                    debug_http_enabled = true;
                     start_debug_http_server(debug.clone(), Some(sink), config);
                 }
                 None => {
@@ -413,7 +425,7 @@ impl AgentTerminal {
             processor,
             sixel_parser: SixelStreamParser::default(),
             grid_size,
-            snapshot: ScreenSnapshot::default(),
+            snapshot: Arc::new(ScreenSnapshot::default()),
             images: TerminalImages::new(),
             cursor_shape: CursorShape::Block,
             force_vertical_cursor: cli.force_vertical_cursor,
@@ -433,6 +445,8 @@ impl AgentTerminal {
             theme: cli.theme,
             font_family: cli.font_family.clone(),
             font_fallbacks,
+            cli_font_fallbacks: cli.font_fallbacks.clone(),
+            font_fallbacks_pending_rescan,
             forced_double_width_chars,
             font_size,
             cell_width,
@@ -468,6 +482,7 @@ impl AgentTerminal {
             paste_guard_prompt_open: false,
             shell_exited: false,
             debug,
+            debug_http_enabled,
             pending_term_events,
             _window_bounds_sub: None,
             _window_activation_sub: None,
@@ -820,19 +835,26 @@ impl AgentTerminal {
         self.cursor_shape = effective_cursor_shape;
         self.update_cursor_visual_target(cursor_row.min(rows.saturating_sub(1)), cursor_col);
 
-        self.snapshot = ScreenSnapshot {
+        self.snapshot = Arc::new(ScreenSnapshot {
             cells,
             cursor_row: cursor_row.min(rows.saturating_sub(1)),
             cursor_col,
             cursor_visible: cursor.shape != CursorShape::Hidden,
             alt_screen,
-        };
+        });
 
+        // 整屏文本行重建只服务 /debug/state；没开 debug HTTP 就别每个 batch
+        // 都做一遍 O(rows×cols) 的字符串拼装（PERF-3）。
+        let screen_lines = if self.debug_http_enabled {
+            snapshot_to_lines(&self.snapshot)
+        } else {
+            Vec::new()
+        };
         self.debug.update_screen_snapshot(
             self.grid_size,
             self.snapshot.cursor_row,
             self.snapshot.cursor_col,
-            snapshot_to_lines(&self.snapshot),
+            screen_lines,
         );
     }
 
@@ -891,6 +913,15 @@ impl AgentTerminal {
             self.last_ax_published_cursor_utf16 = model_cursor_utf16;
         }
         if self.convenience_state.refresh_input_mode_if_due() {
+            cx.notify();
+        }
+
+        // PERF-2：首窗口用保守 fallback 表先开画，后台字体扫描完成后在这里
+        // 换装一次完整表（同一节拍任务，无需额外调度）。
+        if self.font_fallbacks_pending_rescan && crate::font_fallback::background_scan_complete() {
+            self.font_fallbacks_pending_rescan = false;
+            self.font_fallbacks = parse_font_fallbacks(&self.cli_font_fallbacks);
+            self.sync_grid_to_window(window);
             cx.notify();
         }
     }
@@ -1411,14 +1442,25 @@ fn annotate_plain_text_links(cells: &mut [Vec<CellSnapshot>]) {
 
 fn annotate_plain_text_links_for_row(row: &mut [CellSnapshot]) {
     let mut text = String::with_capacity(row.len());
+    let mut col = 0usize;
+    while col < row.len() {
+        let cell = &row[col];
+        cell.push_text_to(&mut text);
+        col = col.saturating_add(cell_advance_cols(cell));
+    }
+
+    // 绝大多数行没有 URL：先做一次纯扫描，没有 scheme 就不再构建 char→col
+    // 映射表（PERF-3，此前每行每 batch 都分配一个 Vec<usize>）。
+    if find_next_url_scheme(&text).is_none() {
+        return;
+    }
+
     let mut char_cols = Vec::with_capacity(row.len());
     let mut col = 0usize;
     while col < row.len() {
         let cell = &row[col];
-        let before = text.chars().count();
-        cell.push_text_to(&mut text);
-        let after = text.chars().count();
-        char_cols.extend(std::iter::repeat_n(col, after.saturating_sub(before)));
+        // push_text_to 恰好贡献 1 + zerowidth.len() 个字符。
+        char_cols.extend(std::iter::repeat_n(col, 1 + cell.zerowidth.len()));
         col = col.saturating_add(cell_advance_cols(cell));
     }
 

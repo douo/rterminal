@@ -1,6 +1,10 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_AUTO_FALLBACKS: usize = 32;
+
+static DISCOVERED_FALLBACKS: OnceLock<Vec<String>> = OnceLock::new();
+static SCAN_SPAWNED: AtomicBool = AtomicBool::new(false);
 
 const PUA_PROBES: &[char] = &[
     '\u{e0a0}', // Powerline branch
@@ -47,11 +51,41 @@ pub(crate) fn font_fallback_families(raw: &[String]) -> Vec<String> {
     merge_font_fallback_families(raw, terminal_fallback_families())
 }
 
+/// 系统字体全量扫描（`ttf_parser` 逐面解析）在字体多的机器上要数百 ms。
+/// 首窗口创建路径不等它（PERF-2）：先返回保守回退表，扫描在后台线程做，
+/// 完成后由终端侧的周期任务检测 [`background_scan_complete`] 并换装完整表。
 fn terminal_fallback_families() -> Vec<String> {
-    static FALLBACKS: OnceLock<Vec<String>> = OnceLock::new();
-    FALLBACKS
-        .get_or_init(discover_terminal_fallback_families)
-        .clone()
+    if let Some(discovered) = DISCOVERED_FALLBACKS.get() {
+        return discovered.clone();
+    }
+
+    if !SCAN_SPAWNED.swap(true, Ordering::SeqCst) {
+        let _ = std::thread::Builder::new()
+            .name("font-fallback-scan".to_string())
+            .spawn(|| {
+                let _ = DISCOVERED_FALLBACKS.set(discover_terminal_fallback_families());
+            });
+    }
+
+    conservative_fallback_families()
+}
+
+/// 后台扫描是否已完成（完成后 [`font_fallback_families`] 返回完整表）。
+pub(crate) fn background_scan_complete() -> bool {
+    DISCOVERED_FALLBACKS.get().is_some()
+}
+
+/// macOS 必装字体，覆盖 CJK / emoji / 常用符号：扫描完成前的保守回退。
+fn conservative_fallback_families() -> Vec<String> {
+    [
+        "PingFang SC",
+        "Hiragino Sans",
+        "Apple Color Emoji",
+        "Apple Symbols",
+        "Menlo",
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 fn discover_terminal_fallback_families() -> Vec<String> {

@@ -1,0 +1,36 @@
+Subject: [PATCH] gpui_macos: actually append CoreText system fallbacks
+
+`append_system_fallbacks` built an iterator chain with `.iter().filter().map()`
+and never consumed it, so the closure never ran and no system cascade entry was
+ever appended to `fallback_array`. On macOS this means CoreText's locale-aware
+cascade list is silently dropped, and CJK codepoints fall through to whatever
+user fallback happens to cover them (often a handwriting face such as
+`Hannotate TC` / `HanziPen TC`).
+
+The `font_path().is_some()` filter is dropped as well: macOS system fonts such
+as PingFang SC are not backed by a conventional file path, so the filter would
+have excluded exactly the fonts we need even once the iterator was consumed.
+
+Upstream issue: https://github.com/zed-industries/zed/issues/57916
+Applies to: zed rev 19c8363a8e0d8a2f7a7181bab2c14d87390c0f25
+
+diff --git a/crates/gpui_macos/src/open_type.rs b/crates/gpui_macos/src/open_type.rs
+index 048ba13dd1..99a9d08ae6 100644
+--- a/crates/gpui_macos/src/open_type.rs
++++ b/crates/gpui_macos/src/open_type.rs
+@@ -125,12 +125,9 @@ fn append_system_fallbacks(fallback_array: CFMutableArrayRef, font_ref: CTFontRe
+         let default_fallbacks: CFArray<CTFontDescriptor> =
+             CFArray::wrap_under_create_rule(default_fallbacks);
+ 
+-        default_fallbacks
+-            .iter()
+-            .filter(|desc| desc.font_path().is_some())
+-            .map(|desc| {
+-                CFArrayAppendValue(fallback_array, desc.as_concrete_TypeRef() as _);
+-            });
++        for desc in default_fallbacks.iter() {
++            CFArrayAppendValue(fallback_array, desc.as_concrete_TypeRef() as _);
++        }
+     }
+ }
+ 

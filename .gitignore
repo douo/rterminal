@@ -1,2 +1,6 @@
 target/
+dist/
+.DS_Store
+**/.DS_Store
+vendor/*/Cargo.lock
 research/ghostty/

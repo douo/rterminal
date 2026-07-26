@@ -3,6 +3,14 @@ name = "agent_terminal"
 version = "0.1.0"
 edition = "2024"
 
+# vendored alacritty_terminal 必须是 workspace 成员，否则它的 180 个测试永远跑不到：
+# path 依赖 + 非成员的组合会让 `cargo test -p alacritty_terminal` 直接报
+# "requires dev-dependencies and is not a member of the workspace"。
+# 我们自己在它里面加了 sixel 支持（见 vendor/alacritty_terminal/VENDOR.md），
+# 那部分改动尤其需要上游测试兜住。
+[workspace]
+members = ["vendor/alacritty_terminal"]
+
 [dependencies]
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
 anyhow = "1"

@@ -159,28 +159,9 @@ pub(crate) fn palette_for(theme: Theme) -> RenderPalette {
 
 impl Render for AgentTerminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 渲染保持只读：AX 同步与输入法状态刷新在 `sync_ax_and_input_state`
+        //（周期任务）里，不要加回到这里。
         window.set_window_title(&self.window_title());
-        let model_line = self.input_line.clone();
-        let model_cursor_utf16 = self.input_cursor_utf16;
-        let allow_ax_override = self.allow_ax_override();
-        let sync_result = crate::macos_ax::sync_native_ax_input_view(
-            window,
-            &model_line,
-            model_cursor_utf16,
-            &self.last_ax_published_line,
-            self.last_ax_published_cursor_utf16,
-            allow_ax_override,
-        );
-        if let Some(state) = sync_result.override_from_ax
-            && self.apply_external_ax_input_state(state)
-        {
-            cx.notify();
-        }
-        if sync_result.published_model {
-            self.last_ax_published_line = model_line;
-            self.last_ax_published_cursor_utf16 = model_cursor_utf16;
-        }
-
         let snapshot = self.snapshot.clone();
         let images = self.images.clone();
         let ime_marked_text = self.ime_marked_text.clone();
@@ -205,9 +186,6 @@ impl Render for AgentTerminal {
         let line_height = self.line_height();
         let note = self.debug.note();
         let selection = self.selection_bounds();
-        if self.convenience_state.refresh_input_mode_if_due() {
-            cx.notify();
-        }
         let input_mode = self.convenience_state.input_mode();
         let palette = palette_for(self.theme);
         let cursor_bg = cursor_color_for_focus(palette.cursor_bg, input_mode, window_active);

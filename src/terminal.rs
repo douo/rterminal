@@ -63,6 +63,9 @@ const MAX_PTY_BATCH_CHUNKS: usize = 256;
 const MAX_PTY_BATCH_BYTES: usize = 256 * 1024;
 const CURSOR_SLIDE_DURATION: Duration = Duration::from_millis(80);
 const CURSOR_SLIDE_MAX_COL_DELTA: f32 = 8.0;
+/// AX 同步节拍。上限即外部 AX 覆写（语音工具改写命令行）的最大发现延迟；
+/// 每拍只有几次 objc 调用，无内容变化时不触发重绘。
+const AX_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AgentTerminalOptions {
@@ -265,6 +268,8 @@ pub(crate) struct AgentTerminal {
     pub(crate) _pump_task: Task<Result<()>>,
     /// 主线程消费 debug 注入的任务（仅在 --debug-http 开启时存在）。
     pub(crate) _debug_input_task: Option<Task<Result<()>>>,
+    /// AX 影子输入行与输入法状态的周期同步（ARCH-4：这些副作用不属于 render）。
+    pub(crate) _ax_sync_task: Task<Result<()>>,
 }
 
 impl AgentTerminal {
@@ -471,6 +476,7 @@ impl AgentTerminal {
             input_method_watch_task: None,
             _pump_task: Task::ready(Ok(())),
             _debug_input_task: None,
+            _ax_sync_task: Task::ready(Ok(())),
         };
 
         this.refresh_snapshot();
@@ -503,6 +509,19 @@ impl AgentTerminal {
                 }),
             );
         this.sync_grid_to_window(window);
+
+        // ARCH-4：AX 同步是"轮询外部状态 + 回写模型"的双向副作用，此前放在
+        // Render::render 里——渲染函数因此成了事件循环钩子，且外部 AX 写入要等到
+        // 恰好有一帧渲染才被发现。改成独立的周期任务后 render 恢复只读，
+        // AX 覆写的发现延迟也从"不确定（取决于是否有帧）"变成固定上限。
+        this._ax_sync_task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AX_SYNC_INTERVAL).await;
+                this.update_in(cx, |this, window, cx| {
+                    this.sync_ax_and_input_state(window, cx);
+                })?;
+            }
+        });
 
         if let Some(rx) = output_rx {
             this._pump_task = cx.spawn(async move |this, cx| {
@@ -794,6 +813,36 @@ impl AgentTerminal {
 
     pub(crate) fn refresh_convenience_state(&mut self, cx: &mut Context<Self>) {
         if self.convenience_state.refresh_input_mode() {
+            cx.notify();
+        }
+    }
+
+    /// 双向 AX 同步 + 输入法状态刷新（周期任务驱动，见 `_ax_sync_task`）。
+    ///
+    /// 读方向：发现外部工具经 AX 改写的输入行并回写模型；写方向：把影子输入行
+    /// 发布给 AX。二者都可能改 `self`，所以它们必须待在 update 路径而不是 render 里。
+    fn sync_ax_and_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let model_line = self.input_line.clone();
+        let model_cursor_utf16 = self.input_cursor_utf16;
+        let allow_ax_override = self.allow_ax_override();
+        let sync_result = crate::macos_ax::sync_native_ax_input_view(
+            window,
+            &model_line,
+            model_cursor_utf16,
+            &self.last_ax_published_line,
+            self.last_ax_published_cursor_utf16,
+            allow_ax_override,
+        );
+        if let Some(state) = sync_result.override_from_ax
+            && self.apply_external_ax_input_state(state)
+        {
+            cx.notify();
+        }
+        if sync_result.published_model {
+            self.last_ax_published_line = model_line;
+            self.last_ax_published_cursor_utf16 = model_cursor_utf16;
+        }
+        if self.convenience_state.refresh_input_mode_if_due() {
             cx.notify();
         }
     }

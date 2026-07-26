@@ -100,6 +100,12 @@ fn terminal_fallback_families_from_db(db: &fontdb::Database) -> Vec<String> {
         let Some(family) = preferred_family_name(face) else {
             continue;
         };
+        // 点前缀是 macOS 私有字体（".Apple Color Emoji UI"、".SF NS Mono"…）：
+        // CoreText 拒绝按名解析这类字体并回退到 TimesNewRoman，放进 fallback
+        // 表只会产生一堆警告加一个错误的兜底字体。
+        if family.starts_with('.') {
+            continue;
+        }
         let Some((coverage_score, coverage_tie_breaker)) = glyph_coverage_score(db, face.id) else {
             continue;
         };
